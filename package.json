@@ -1,5 +1,7 @@
 {
   "name": "localmind",
+  "productName": "LocalMind",
+  "description": "Run open-source LLMs entirely on your device. Tauri 2 + React + llama.cpp.",
   "private": true,
   "version": "0.1.0",
   "type": "module",

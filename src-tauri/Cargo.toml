@@ -1,9 +1,10 @@
 [package]
 name = "localmind"
 version = "0.1.0"
-description = "LocalMind - run open-source LLMs locally"
-authors = ["LocalMind"]
+description = "LocalMind — run open-source LLMs entirely on your device."
+authors = ["LocalMind contributors"]
 edition = "2021"
+readme = "../README.md"
 
 [lib]
 name = "localmind_lib"
