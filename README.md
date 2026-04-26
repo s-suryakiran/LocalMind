@@ -35,7 +35,9 @@ LocalMind is a desktop app that runs open-source language models locally and exp
 
 ## Screenshots
 
-> _Add screenshots here_ — chat view, marketplace, mobile PWA. Drop PNGs in `assets/screenshots/` and reference them inline.
+| Chat | Marketplace |
+|------|-------------|
+| ![LocalMind chat view](assets/screenshots/home_page.png) | ![LocalMind marketplace](assets/screenshots/marketplace.png) |
 
 ## Quickstart
 
