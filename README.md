@@ -83,7 +83,7 @@ The phone uses whichever model the desktop has loaded. See the [phone setup note
 ## Architecture
 
 ```
-┌────────────────────────────┐          LAN (HTTP)          ┌────────────────────┐
+┌────────────────────────────┐          LAN (HTTP)         ┌────────────────────┐
 │  Desktop (Tauri 2)         │                             │  Phone PWA         │
 │                            │   /v1/chat/completions      │                    │
 │  React UI ◄────────────────┼◄──── Bearer token ──────────┤  React UI          │
