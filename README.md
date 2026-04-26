@@ -83,22 +83,19 @@ The phone uses whichever model the desktop has loaded. See the [phone setup note
 ## Architecture
 
 ```
-┌────────────────────────┐         LAN (HTTP)         ┌──────────────────┐
-│  Desktop (Tauri 2)     │                            │  Phone PWA       │
-│                        │   /v1/chat/completions     │                  │
-│  React UI ◄────────────┤◄───── (bearer token) ──────┤  React UI (same  │
-│       │                │                            │   bundle)        │
-│       ▼                │   /api/pair                │                  │
-│  Tauri command IPC     │   /api/status              │                  │
-│       │                │                            │                  │
-│       ▼                │                            │                  │
-│  Rust backend          │                            │                  │
-│  ├─ llama.rs ──────────┤──── spawns ────► llama-server (port 8181)     │
-│  ├─ models.rs           │                  llama-server-embed (8182)    │
-│  ├─ rag.rs              │                                               │
-│  ├─ sd.rs ──────────── ┤──── runs ──────► sd CLI (one-shot per image) │
-│  └─ server.rs ──────── ┤──── Axum on 0.0.0.0:3939 ─┘                   │
-└────────────────────────┘                                               │
+┌────────────────────────────┐          LAN (HTTP)          ┌────────────────────┐
+│  Desktop (Tauri 2)         │                             │  Phone PWA         │
+│                            │   /v1/chat/completions      │                    │
+│  React UI ◄────────────────┼◄──── Bearer token ──────────┤  React UI          │
+│      │      Tauri IPC      │   /api/pair                 │  (same bundle)     │
+│      ▼                     │   /api/status               └────────────────────┘
+│  Rust backend              │
+│  ├─ llama.rs ──────────────┼──── spawns ───► llama-server :8181
+│  ├─ models.rs              │                llama-server-embed :8182
+│  ├─ rag.rs                 │
+│  ├─ sd.rs ─────────────────┼──── runs ─────► sd CLI (one-shot per image)
+│  └─ server.rs ─────────────┼──── Axum on 0.0.0.0:3939
+└────────────────────────────┘
 ```
 
 - **Frontend** (`src/`) — React 19 + TypeScript + Tailwind v4, Zustand for state, single bundle shared between desktop and PWA.
