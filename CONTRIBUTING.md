@@ -148,7 +148,7 @@ PRs need:
 
 Before opening an issue:
 
-1. Check existing [issues](https://github.com/<you>/LocalMind/issues) — yours might already be tracked.
+1. Check existing [issues](https://github.com/s-suryakiran/LocalMind/issues) — yours might already be tracked.
 2. Reproduce on `main`.
 
 Use the [Bug Report](.github/ISSUE_TEMPLATE/bug_report.yml) template. Include:
@@ -167,9 +167,9 @@ Open a [Feature Request](.github/ISSUE_TEMPLATE/feature_request.yml). For larger
 
 Look for issues tagged:
 
-- [`good first issue`](https://github.com/<you>/LocalMind/labels/good%20first%20issue) — small, well-scoped tasks
-- [`help wanted`](https://github.com/<you>/LocalMind/labels/help%20wanted) — anything we'd love a contributor to take on
-- [`platform-linux`](https://github.com/<you>/LocalMind/labels/platform-linux), [`platform-windows`](https://github.com/<you>/LocalMind/labels/platform-windows) — Mac is best-tested; help on other platforms is invaluable
+- [`good first issue`](https://github.com/s-suryakiran/LocalMind/labels/good%20first%20issue) — small, well-scoped tasks
+- [`help wanted`](https://github.com/s-suryakiran/LocalMind/labels/help%20wanted) — anything we'd love a contributor to take on
+- [`platform-linux`](https://github.com/s-suryakiran/LocalMind/labels/platform-linux), [`platform-windows`](https://github.com/s-suryakiran/LocalMind/labels/platform-windows) — Mac is best-tested; help on other platforms is invaluable
 
 Some areas we know we want help with:
 
@@ -181,7 +181,7 @@ Some areas we know we want help with:
 
 ## Questions?
 
-- Open a [Discussion](https://github.com/<you>/LocalMind/discussions) for design questions.
-- Open an [Issue](https://github.com/<you>/LocalMind/issues) for bugs or concrete features.
+- Open a [Discussion](https://github.com/s-suryakiran/LocalMind/issues) for design questions.
+- Open an [Issue](https://github.com/s-suryakiran/LocalMind/issues) for bugs or concrete features.
 
 Thanks again for helping make LocalMind better.
