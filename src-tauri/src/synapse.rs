@@ -143,11 +143,22 @@ impl SynapseState {
         // line so the UI can show *why* discovery isn't happening.
         let advertised = match self.advertise(port).await {
             Ok(info) => {
+                let addrs = info
+                    .get_addresses()
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let _ = app.emit(
                     "synapse:log",
                     serde_json::json!({
                         "stream": "stdout",
-                        "line": format!("mDNS advertise OK: {}", info.get_fullname()),
+                        "line": format!(
+                            "mDNS advertise OK: {} on {} (port {})",
+                            info.get_fullname(),
+                            if addrs.is_empty() { "<no addr>".to_string() } else { addrs },
+                            port,
+                        ),
                     }),
                 );
                 Some(info)
