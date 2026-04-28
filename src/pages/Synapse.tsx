@@ -30,8 +30,13 @@ type LogEntry = {
 // inference is actually engaged. Mentioned RPC backends, buffer tables, layer
 // offloads, and any errors qualify — those are the lines that prove a layer
 // split actually happened.
+// Lines we want to surface in the highlights view: anything that proves a
+// distributed inference path is engaged (RPC, offload, layer split), anything
+// about discovery (mDNS, advertise, peer), and any errors. The default-on
+// "Highlights" toggle is meant to skip llama.cpp's chatty progress lines, not
+// hide our own diagnostics — so this list has to cover both.
 const HIGHLIGHT_RE =
-  /\b(rpc|offload|buffer size|backend|n_layer|tensor split|error|failed|timeout)\b/i;
+  /\b(rpc|offload|buffer size|backend|n_layer|tensor split|mdns|advertise|peer|synapse|error|failed|timeout)\b/i;
 
 export function Synapse() {
   const remote = !isTauri();
