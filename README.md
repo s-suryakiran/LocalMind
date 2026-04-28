@@ -39,6 +39,27 @@ LocalMind is a desktop app that runs open-source language models locally and exp
 |------|-------------|
 | ![LocalMind chat view](assets/screenshots/home_page.png) | ![LocalMind marketplace](assets/screenshots/marketplace.png) |
 
+## Install
+
+Grab a prebuilt installer from the [Releases page](https://github.com/s-suryakiran/LocalMind/releases) — no toolchain required:
+
+| Platform | File |
+|---|---|
+| Windows | `LocalMind_<version>_x64-setup.exe` (NSIS installer) |
+| macOS (Apple Silicon) | `LocalMind_<version>_aarch64.dmg` |
+| Linux | `localmind_<version>_amd64.deb` / `LocalMind_<version>_amd64.AppImage` |
+| Android (preview) | `LocalMind_<version>_android-debug.apk` |
+
+> **macOS:** these builds are not yet code-signed. After dragging `LocalMind.app` to Applications you may see *"LocalMind is damaged and can't be opened"* — that's macOS Gatekeeper quarantining unsigned downloads, **not** actual corruption. Strip the quarantine attribute once and it will open normally:
+>
+> ```bash
+> xattr -cr /Applications/LocalMind.app
+> ```
+>
+> **Windows:** SmartScreen may show *"Windows protected your PC"* on first launch — click **More info** → **Run anyway**. Both warnings will go away once we add code-signing.
+
+Or [build from source](#quickstart) if you'd rather hack on it.
+
 ## Quickstart
 
 ### Prerequisites

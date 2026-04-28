@@ -3,15 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+  release:
+    types: [created, published]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
-  # ── Frontend ────────────────────────────────────────────────────────────────
   frontend:
     name: Frontend (tsc + build)
     runs-on: ubuntu-latest
@@ -32,10 +38,8 @@ jobs:
       - name: Production build
         run: npm run build
         env:
-          # Tauri injects this; stub it out so the Vite build succeeds in CI.
           TAURI_ENV_PLATFORM: linux
 
-  # ── Backend ─────────────────────────────────────────────────────────────────
   backend:
     name: Backend (fmt + clippy + check)
     runs-on: ubuntu-latest
@@ -71,7 +75,169 @@ jobs:
         working-directory: src-tauri
         run: cargo check --all-targets
 
-  # ── Summary gate (single branch-protection target) ──────────────────────────
+  release-desktop:
+    name: Release Desktop (${{ matrix.platform }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    needs: [frontend, backend]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system deps
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Set bundle version from tag
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          echo "Setting version to $VERSION (from tag $TAG)"
+          jq --arg v "$VERSION" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          rm src-tauri/Cargo.toml.bak
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: "${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}"
+          releaseName: "LocalMind ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}"
+          releaseDraft: ${{ github.event_name != 'release' }}
+          prerelease: false
+          releaseBody: |
+            **Downloads**
+            - Windows: `LocalMind_*_x64-setup.exe`
+            - macOS: `LocalMind_*.dmg`
+            - Linux: `localmind_*_amd64.deb` / `LocalMind_*_amd64.AppImage`
+            - Android: `LocalMind_*_android-debug.apk` (tech preview)
+
+            > **macOS first launch:** the app is unsigned. After moving it to Applications, run `xattr -cr /Applications/LocalMind.app` once in Terminal, then open normally.
+
+  release-android:
+    name: Release Android (APK)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125'
+
+      - name: Export NDK_HOME
+        run: |
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Set bundle version from tag
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          ANDROID_VERSION=$(echo "$VERSION" | sed -E 's/^0\.0\.0(-.*)?$/0.0.1\1/')
+          if [ "$VERSION" != "$ANDROID_VERSION" ]; then
+            echo "Android rejects 0.0.0; bumping $VERSION -> $ANDROID_VERSION for the APK build"
+          fi
+          jq --arg v "$ANDROID_VERSION" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          jq --arg v "$ANDROID_VERSION" '.version = $v' src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"$ANDROID_VERSION\"/" src-tauri/Cargo.toml
+          rm src-tauri/Cargo.toml.bak
+
+      - name: Initialize Tauri Android project
+        run: npm run tauri android init
+
+      - name: Build APK (debug)
+        run: npm run tauri android build -- --apk --debug
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "No APK produced" >&2
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: localmind-android-debug
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Attach APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          DEST="LocalMind_${VERSION}_android-debug.apk"
+          cp "${{ steps.apk.outputs.path }}" "$DEST"
+          for i in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$DEST" --clobber; then
+              exit 0
+            fi
+            echo "Release not ready yet, retrying in 10s ($i/5)..."
+            sleep 10
+          done
+          echo "Failed to upload APK to release $TAG" >&2
+          exit 1
+
   ci:
     name: CI
     needs: [frontend, backend]
