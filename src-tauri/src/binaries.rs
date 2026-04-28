@@ -176,7 +176,12 @@ pub async fn ensure_llama_server(app: &AppHandle) -> Result<PathBuf> {
     // We pull the matching `cudart-*.zip` from the same release and unpack it
     // alongside.
     if matches!(hw.accelerator, Accelerator::Nvidia { .. }) && hw.os == "windows" {
-        if let Err(e) = ensure_cuda_runtime(app, &client, assets, &target_dir).await {
+        // Pull the CUDA version out of the binary archive name (e.g. "13.1"
+        // from "llama-b8958-bin-win-cuda-13.1-x64.zip") so we can match the
+        // sibling cudart-*.zip exactly. Mismatched versions silently fail at
+        // LoadLibrary time.
+        let cuda_version = extract_cuda_version(&name);
+        if let Err(e) = ensure_cuda_runtime(app, &client, assets, &target_dir, cuda_version.as_deref()).await {
             // Best-effort — log but don't fail the install. The user gets a
             // working CPU fallback either way; without this hint they'd just
             // wonder why their GPU is idle.
@@ -203,6 +208,7 @@ async fn ensure_cuda_runtime(
     client: &reqwest::Client,
     assets: &[serde_json::Value],
     target_dir: &Path,
+    cuda_version: Option<&str>,
 ) -> Result<()> {
     // If cudart64_*.dll already sits next to our binaries, we're done.
     if let Ok(read) = std::fs::read_dir(target_dir) {
@@ -216,13 +222,39 @@ async fn ensure_cuda_runtime(
         }
     }
 
-    let asset = assets
+    // Prefer the cudart whose CUDA version matches the binaries we just
+    // downloaded. Fall back to the highest-numbered cudart if we couldn't
+    // parse a version. Mismatch (e.g. cu12.4 binaries with cu13.1 cudart)
+    // can superficially "load" but produce confusing init failures.
+    let cudart_candidates: Vec<&serde_json::Value> = assets
         .iter()
-        .find(|a| {
+        .filter(|a| {
             let name = a["name"].as_str().unwrap_or("").to_ascii_lowercase();
             name.starts_with("cudart-") && name.contains("win") && name.ends_with(".zip")
         })
-        .ok_or_else(|| anyhow!("no cudart-* asset in release"))?;
+        .collect();
+
+    let asset = if let Some(v) = cuda_version {
+        cudart_candidates
+            .iter()
+            .find(|a| {
+                a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .contains(&format!("cuda-{v}"))
+            })
+            .copied()
+    } else {
+        None
+    }
+    .or_else(|| {
+        cudart_candidates
+            .iter()
+            .max_by_key(|a| a["name"].as_str().unwrap_or("").to_string())
+            .copied()
+    })
+    .ok_or_else(|| anyhow!("no cudart-* asset in release"))?;
 
     let url = asset["browser_download_url"]
         .as_str()
@@ -262,6 +294,24 @@ async fn ensure_cuda_runtime(
     extract_zip(&tmp, target_dir)?;
     let _ = std::fs::remove_file(&tmp);
     Ok(())
+}
+
+/// Pull the `MAJOR.MINOR` CUDA version out of a llama.cpp asset name like
+/// `llama-b8958-bin-win-cuda-13.1-x64.zip`. Returns `None` if the substring
+/// after `cuda-` doesn't look like a version (defensive for future renames).
+fn extract_cuda_version(asset_name: &str) -> Option<String> {
+    let lower = asset_name.to_ascii_lowercase();
+    let after = lower.split("cuda-").nth(1)?;
+    // Take chars up to the next non-version separator.
+    let v: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if v.is_empty() || !v.contains('.') {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 fn pick_llama_asset<'a>(
