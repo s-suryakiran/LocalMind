@@ -12,7 +12,7 @@
 [![llama.cpp](https://img.shields.io/badge/inference-llama.cpp-blueviolet)](https://github.com/ggerganov/llama.cpp)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quickstart](#quickstart) · [Features](#features) · [Architecture](#architecture) · [Contributing](CONTRIBUTING.md) · [Roadmap](#roadmap)
+[Quickstart](#quickstart) · [Features](#features) · [Synapse](#synapse--pool-machines-on-your-lan) · [Architecture](#architecture) · [Contributing](CONTRIBUTING.md) · [Roadmap](#roadmap)
 
 </div>
 
@@ -109,40 +109,61 @@ The phone uses whichever model the desktop has loaded. See the [phone setup note
 
 ```
 ┌────────────────────────────┐          LAN (HTTP)         ┌────────────────────┐
-│  Desktop (Tauri 2)         │                             │  Phone PWA         │
+│  Desktop host (Tauri 2)    │                             │  Phone PWA         │
 │                            │   /v1/chat/completions      │                    │
 │  React UI ◄────────────────┼◄──── Bearer token ──────────┤  React UI          │
 │      │      Tauri IPC      │   /api/pair                 │  (same bundle)     │
 │      ▼                     │   /api/status               └────────────────────┘
 │  Rust backend              │
 │  ├─ llama.rs ──────────────┼──── spawns ───► llama-server :8181
-│  ├─ models.rs              │                llama-server-embed :8182
-│  ├─ rag.rs                 │
-│  ├─ sd.rs ─────────────────┼──── runs ─────► sd CLI (one-shot per image)
-│  └─ server.rs ─────────────┼──── Axum on 0.0.0.0:3939
-└────────────────────────────┘
+│  │                         │                llama-server-embed :8182
+│  ├─ host_proxy.rs ─────────┼──── auth ─────► 127.0.0.1:54xxx ─┐
+│  ├─ models.rs              │                                  │
+│  ├─ rag.rs                 │                                  │  Synapse
+│  ├─ sd.rs ─────────────────┼──── runs ─────► sd CLI           │  (TCP 50052)
+│  ├─ synapse.rs             │                                  │
+│  └─ server.rs ─────────────┼──── Axum on 0.0.0.0:3939         │
+└────────────────────────────┘                                  │
+                                                                ▼
+                                       ┌────────────────────────────────────┐
+                                       │  Worker machine (Tauri 2)          │
+                                       │                                    │
+                                       │  auth_proxy :50052 (token-gated)   │
+                                       │      │                             │
+                                       │      ▼ handshake OK                │
+                                       │  rpc-server :51052 (localhost-only)│
+                                       │                                    │
+                                       │  beacon: UDP 255.255.255.255:50053 │
+                                       │  mDNS:   _localmind-synapse._tcp   │
+                                       └────────────────────────────────────┘
 ```
 
 - **Frontend** (`src/`) — React 19 + TypeScript + Tailwind v4, Zustand for state, single bundle shared between desktop and PWA.
 - **Backend** (`src-tauri/src/`) — Rust, Tauri 2, Axum LAN server. `llama.rs` orchestrates child llama-server processes; `server.rs` proxies `/v1/*` to llama-server and serves the React app for paired phones.
-- **Inference engine** — bundled `llama.cpp` and `stable-diffusion.cpp` binaries downloaded per-platform on first use, cached under `~/Library/Application Support/LocalMind/bin/`.
+- **Synapse** — `synapse.rs` runs the worker's mDNS/UDP beacon and the host's discovery listener. `auth_proxy.rs` (worker side) and `host_proxy.rs` (host side) sit in front of llama.cpp's `rpc-server` and gate every connection through a length-prefixed handshake with a per-worker token. Beacons are HMAC-signed so hosts can verify peer identity before pairing.
+- **Inference engine** — bundled `llama.cpp` and `stable-diffusion.cpp` binaries downloaded per-platform on first use, cached under `~/Library/Application Support/LocalMind/bin/`. NVIDIA + Windows installs auto-fetch the matching CUDA runtime DLLs (`cudart64_*.dll` etc.) so the GPU actually loads.
 
 ## Project structure
 
 ```
 LocalMind/
 ├── src/                      # React frontend
-│   ├── pages/                # Chat, Marketplace, Models, Knowledge, ImageGen, Settings, Connect
-│   ├── components/           # Sidebar, HardwareBadge, etc.
+│   ├── pages/                # Chat, Marketplace, Models, Knowledge, ImageGen, Synapse, Settings, Connect
+│   ├── components/           # Sidebar, HardwareBadge, AddPeerDialog
 │   └── lib/                  # store (Zustand), api (Tauri + LAN), types
 ├── src-tauri/
 │   ├── src/                  # Rust backend
-│   │   ├── llama.rs          # spawns llama-server children
-│   │   ├── binaries.rs       # downloads/extracts llama.cpp + sd
+│   │   ├── llama.rs          # spawns llama-server children + tok/s parser
+│   │   ├── binaries.rs       # downloads/extracts llama.cpp + sd + cudart
 │   │   ├── models.rs         # HF search, download, listing
 │   │   ├── rag.rs            # document ingest + embedding search
 │   │   ├── sd.rs             # stable-diffusion.cpp orchestration
-│   │   └── server.rs         # Axum LAN server + auth
+│   │   ├── server.rs         # Axum LAN server + auth
+│   │   ├── synapse.rs        # mDNS/UDP discovery + signed beacons
+│   │   ├── synapse_proto.rs  # handshake framing + HMAC primitives
+│   │   ├── synapse_token.rs  # persisted per-worker token
+│   │   ├── auth_proxy.rs     # worker-side token-gated TCP proxy
+│   │   └── host_proxy.rs     # host-side per-worker proxy + RTT pinger
 │   ├── icons/                # platform icon bundle
 │   └── Cargo.toml
 ├── public/                   # PWA manifest + icons
@@ -178,6 +199,61 @@ npm run tauri android dev
 
 The native build hits the same Connect screen on first launch.
 
+## Synapse — pool machines on your LAN
+
+Run a model whose weights don't fit on a single device by pipeline-sharding layers across multiple computers on your local Wi-Fi or Ethernet. Use a Mac mini's unified memory **plus** a desktop's NVIDIA GPU; or chain three machines together for a 70B model that won't load on any one of them alone.
+
+Built on llama.cpp's `--rpc` mechanism, with auth, discovery, telemetry, and per-worker layer-split control wrapped on top.
+
+### Setup (60 seconds)
+
+**On the worker** (the machine donating compute):
+1. Open Synapse → **Start worker**
+2. Copy the token from the *Worker token* card
+
+**On the host** (the machine running the model):
+1. Open Synapse → wait for the worker to appear in *Discovered on LAN*
+2. Click **Use** → paste the token → **Add**
+3. Load any model from Marketplace or My-models — layers automatically shard across both machines
+
+The host shows live tok/s as a sparkline and per-worker RTT as a coloured badge while the model is loaded.
+
+### How it works
+
+```
+host (your Mac)                                   worker (any machine)
+─────────────────                                 ──────────────────────
+llama-server                                      auth_proxy :50052 ───┐
+   │                                              (token-gated)       │
+   ▼ --rpc 127.0.0.1:54712                                             │
+host_proxy ──── handshake (token) ─────────────▶ ◀──────────────────── ┘
+   │           tokio::io::copy_bidirectional             │
+                                                         ▼
+                                                    rpc-server :51052
+                                                    (localhost-only)
+```
+
+- **Discovery** — workers advertise via mDNS (`_localmind-synapse._tcp`) and a UDP broadcast beacon as a fallback for networks where multicast is blocked (most Wi-Fi APs with client isolation).
+- **Auth** — each worker has a persisted 256-bit token. The auth proxy on `:50052` requires it via a length-prefixed JSON handshake before forwarding bytes to the localhost-bound `rpc-server` on `:51052`. Bad handshakes get rejected within 5 s and never open the upstream socket. Constant-time token compare via `subtle::ConstantTimeEq`.
+- **Beacon integrity** — UDP beacons are HMAC-SHA256 signed with the token. Hosts that have the token verify the signature and show a green ✓; hosts without it show "unverified" so spoofed peers can't masquerade as a paired worker.
+- **Layer split** — by default llama.cpp distributes layers evenly. The Synapse tab has per-worker percentage sliders that build `--tensor-split` so a 4090 worker can take 80% of the model while an M1 Pro host takes the rest.
+- **Observability** — host parses `eval time` lines from llama.cpp stderr for live tok/s, and re-runs the auth handshake against each worker every 5 s for round-trip latency.
+- **Marketplace integration** — files that won't fit on the host alone show a **Needs Synapse** badge; files that won't fit even with the current cluster get **Too Large**.
+
+### Caveats
+
+- **Trust the LAN.** The proxy gates by token but doesn't currently use TLS — only run worker mode on networks you control. The threat model assumes the LAN is mostly trusted; auth defends against drive-by attempts and untrusted devices on your own network, not against state-level actors.
+- **Wired Ethernet is faster.** Pipeline-parallel inference moves activations between every layer transition; Wi-Fi RTT is usually the bottleneck. Expect a ~30–50% throughput hit going from wired to Wi-Fi.
+- **Workers must run the same llama.cpp build** — binary ABI matters; mismatches produce confusing init failures.
+- **Phase 3 is a breaking change** — Phase 2 hosts can't talk to Phase 3 workers (and vice versa). Update both ends together.
+
+### Troubleshooting
+
+- **No peers in Discovered on LAN** — make sure both machines are on the same subnet (not isolated guest Wi-Fi). The UDP beacon should reach across most networks; if it doesn't, the live logs panel on the worker shows `mDNS advertise failed: …` or `UDP beacon failed: …` with the specific reason.
+- **`auth probe to X: invalid token`** when loading a model — the host's stored token doesn't match the worker's. Click ✎ on the worker chip and paste the current token from the worker's Synapse tab.
+- **Worker chip stays "unverified"** — host is receiving the beacon but the HMAC doesn't match. Almost always means the worker rotated its token and the host has the old value. Re-paste the new one.
+- **Slow tok/s with a fast worker** — open the *Layer split* `<details>` and bias more layers toward the faster device. Resetting falls back to llama.cpp's default heuristic.
+
 ## Contributing
 
 We love PRs. **Start here: [CONTRIBUTING.md](CONTRIBUTING.md)**.
@@ -194,9 +270,16 @@ If you're not sure where to start, open a discussion or pick anything labeled [`
 
 ## Roadmap
 
+Shipped:
+- [x] Synapse v1 — manual LAN pipeline-shard via llama.cpp RPC
+- [x] Synapse v2 — auto-discovery (mDNS + UDP beacon), dedicated UI, GPU runtime auto-fetch on Windows
+- [x] Synapse v3 — token-gated auth proxy, HMAC-signed beacons, live tok/s + RTT, manual layer split, marketplace size hints
+
+Next:
 - [ ] Service-worker-backed offline shell for the PWA
 - [ ] Tauri Mobile (iOS/Android) reaching parity with the PWA
 - [ ] Multi-model concurrent serving (chat + embed + vision in one session)
+- [ ] Synapse v4 — TLS on the proxy channel, mid-inference reconnect, auto-tuned layer split, multi-host workers
 - [ ] Speaker diarization for voice
 - [ ] Plugin system for custom tools
 
@@ -206,10 +289,16 @@ If you're not sure where to start, open a discussion or pick anything labeled [`
 - **Model output loops on a fragment** — sampler defaults of `repeat_penalty=1.1` and `frequency_penalty=0.3` prevent most loops. If still bad, try a different quant.
 - **`llama-server did not become ready`** — usually a port conflict. Stop the model from My-models and try again; orphaned servers on 8181/8182 are auto-killed before respawn.
 - **Phone PWA blank** — visit `<lan-url>/?reset` to clear stored state, or remove the home-screen icon and re-add it.
+- **NVIDIA worker on Windows is using CPU instead of GPU** — first install fetches the matching CUDA runtime DLLs (`cudart64_*.dll`, `cublas64_*.dll`) automatically. If you upgraded from an older build, delete `%APPDATA%\LocalMind\bin\` and restart so the cudart fetch runs. RTX 50-series (Blackwell) needs the cu13.1 build; the asset picker prefers it lexicographically.
+- **Synapse-related issues** — see the dedicated [Synapse troubleshooting](#troubleshooting-1) section above. The Synapse tab's live logs panel surfaces handshake failures, mDNS advertise errors, and beacon send failures inline.
 
 ## Security
 
-LocalMind's LAN server requires a paired bearer token for `/api/*` and `/v1/*` routes. The PIN regenerates on every desktop start. **Communication is HTTP over your local Wi-Fi** — anyone on the same network can attempt to pair if they know the PIN. For sensitive use, treat your LAN as the trust boundary.
+**Phone PWA pairing** — the LAN server requires a paired bearer token for `/api/*` and `/v1/*` routes. The PIN regenerates on every desktop start. Communication is HTTP over your local Wi-Fi; anyone on the same network can attempt to pair if they know the PIN.
+
+**Synapse worker auth** — `rpc-server` binds `127.0.0.1:51052` only and is unreachable from the network directly. The `auth_proxy` on `:50052` requires a per-worker token (256 bits, base32-encoded) in a length-prefixed handshake before forwarding any bytes. Tokens are persisted at `<data_dir>/synapse-token.txt` and compared in constant time. Failed handshakes never open the upstream socket — brute-force attackers can't even probe the rpc-server protocol. Beacons are HMAC-SHA256 signed so spoofed peers can't masquerade as a paired worker.
+
+Treat your LAN as the trust boundary. The threat model assumes the local network is mostly trusted; the auth here defends against drive-by attempts and untrusted devices on your own network, not against state-level actors. TLS on the Synapse channel is on the Phase 4 list.
 
 If you find a security issue, please [report it privately](SECURITY.md) rather than opening a public issue.
 
