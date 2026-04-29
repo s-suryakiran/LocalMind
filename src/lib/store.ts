@@ -1,6 +1,14 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { Conversation, HardwareInfo, InstalledModel, LlamaStatus, RagDocument, SdImage } from "./types";
+import type {
+  Conversation,
+  HardwareInfo,
+  InstalledModel,
+  LlamaStatus,
+  RagDocument,
+  SdImage,
+  SynapseWorker,
+} from "./types";
 import { uid } from "./util";
 
 const activeChatRequests = new Map<string, AbortController>();
@@ -82,13 +90,23 @@ interface AppState {
   connection: { url: string; token: string } | null;
   setConnection: (c: { url: string; token: string } | null) => void;
 
-  // Synapse: distributed inference across LAN machines (Phase 1: manual).
-  // `workers` is a list of `host:port` strings the host appends as `--rpc`.
-  // `workerEnabled` reflects whether *this* machine is running rpc-server.
-  synapse: { workerEnabled: boolean; workerPort: number; workers: string[] };
+  // Synapse: distributed inference across LAN machines.
+  // Phase 3: each worker now carries an auth token. The host spins up a
+  // local proxy per worker that handshakes with that token before any rpc
+  // bytes flow. `workerEnabled` reflects whether *this* machine is running
+  // a Synapse worker (rpc-server + auth proxy).
+  synapse: {
+    workerEnabled: boolean;
+    workerPort: number;
+    workers: SynapseWorker[];
+    /** Phase 3 chunk G: relative weight for the host device when explicit
+     *  layer split is in use. Undefined → llama.cpp's default heuristic. */
+    hostWeight?: number;
+  };
   setSynapseWorkerEnabled: (enabled: boolean) => void;
   setSynapseWorkerPort: (port: number) => void;
-  setSynapseWorkers: (workers: string[]) => void;
+  setSynapseWorkers: (workers: SynapseWorker[]) => void;
+  setSynapseHostWeight: (weight: number | undefined) => void;
 }
 
 const emptyLlama: LlamaStatus = {
@@ -210,9 +228,28 @@ export const useApp = create<AppState>()(
         set((s) => ({ synapse: { ...s.synapse, workerPort } })),
       setSynapseWorkers: (workers) =>
         set((s) => ({ synapse: { ...s.synapse, workers } })),
+      setSynapseHostWeight: (hostWeight) =>
+        set((s) => ({ synapse: { ...s.synapse, hostWeight } })),
     }),
     {
       name: "localmind-store",
+      // Bumped from default 0 → 1 in Phase 3 because synapse.workers changed
+      // shape from string[] to {endpoint, token}[]. Without the migration,
+      // existing users would crash on first render with "w.endpoint is
+      // undefined" deep in the Synapse page.
+      version: 1,
+      migrate: (persisted: unknown, version: number) => {
+        const s = (persisted ?? {}) as Record<string, unknown>;
+        if (version < 1 && s.synapse && typeof s.synapse === "object") {
+          const syn = s.synapse as { workers?: unknown };
+          if (Array.isArray(syn.workers)) {
+            syn.workers = syn.workers
+              .filter((w): w is string => typeof w === "string")
+              .map((endpoint): SynapseWorker => ({ endpoint, token: "" }));
+          }
+        }
+        return s;
+      },
       partialize: (s) => ({
         conversations: s.conversations,
         activeConvId: s.activeConvId,

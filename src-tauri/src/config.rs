@@ -56,9 +56,7 @@ pub fn sd_output_dir() -> PathBuf {
 
 /// Path to the persisted Synapse worker token. Generated on first worker start
 /// and reused across restarts so the same machine keeps the same identity to
-/// all hosts that have already paired with it. Consumer lands in Phase 3
-/// chunk B (worker auth proxy); marked allow until then.
-#[allow(dead_code)]
+/// all hosts that have already paired with it.
 pub fn synapse_token_path() -> PathBuf {
     data_dir().join("synapse-token.txt")
 }

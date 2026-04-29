@@ -1,8 +1,8 @@
-// Phase 3 chunk A: lays down the protocol + helpers used by the worker
-// auth proxy (chunk B), the host-side local proxy pool (chunk C), and the
-// HMAC-signed beacon (chunk E). Items here are intentionally unused until
-// those chunks land — silence dead-code at module scope rather than at
-// every fn so the noise doesn't drown out genuine warnings later.
+// Phase 3 wire protocol for the worker auth proxy and host-side local proxy.
+// Some helpers (HandshakeRequest writer, HMAC verify) are still consumer-
+// less until chunks C/E land — keep the module-scope dead_code allow for
+// just those couple items rather than per-fn churn. Each fn is kept pub so
+// downstream chunks don't have to re-export.
 #![allow(dead_code)]
 
 // Synapse Phase 3 wire protocol for the worker auth proxy.

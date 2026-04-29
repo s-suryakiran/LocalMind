@@ -1,4 +1,4 @@
-use crate::{binaries, hardware, models};
+use crate::{binaries, hardware, host_proxy::HostProxy, models};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
@@ -7,6 +7,25 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+/// One Synapse worker the host wants to pipeline-shard layers onto. Phase 3
+/// adds the token field — every authenticated worker has a unique token,
+/// shown in its Synapse UI, that the host pastes here.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SynapseWorker {
+    /// `host:port` of the worker's auth proxy (the public-facing port).
+    pub endpoint: String,
+    /// Base32-encoded token from the worker. Without it, the handshake is
+    /// rejected and the model load fails fast at `start`.
+    pub token: String,
+    /// Phase 3 chunk G: relative compute weight (0.0–1.0). When any worker
+    /// has a non-default weight, we pass `--tensor-split host,w1,w2,…` so
+    /// llama.cpp distributes layers proportionally instead of evenly.
+    /// `None` (or 0.0) means "use llama.cpp's default" — even split.
+    #[serde(default)]
+    pub weight: Option<f32>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -18,10 +37,17 @@ pub struct LlamaSettings {
     pub port: Option<u16>,
     pub mmproj_id: Option<String>,
     pub flash_attn: Option<bool>,
-    /// Comma-separated `host:port` Synapse workers (Phase 1: manual entry).
-    /// When set, llama-server is launched with `--rpc <list>` so layers are
-    /// pipeline-sharded across this host plus each worker.
-    pub synapse_workers: Option<Vec<String>>,
+    /// Synapse workers to pipeline-shard layers onto. For each entry we spin
+    /// up a local proxy that handshakes with the worker using the supplied
+    /// token; llama-server then connects to the local proxy address. The
+    /// final `--rpc` arg is built from those local addresses, so the remote
+    /// IPs/tokens never appear on the llama-server command line.
+    pub synapse_workers: Option<Vec<SynapseWorker>>,
+    /// Phase 3 chunk G: relative weight for the *host* device in the layer
+    /// split. Combined with each worker's `weight` to build `--tensor-split`.
+    /// `None` keeps llama.cpp's default (even split).
+    #[serde(default)]
+    pub host_weight: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +84,11 @@ impl ServerHandle {
 pub struct LlamaState {
     chat: Mutex<ServerHandle>,
     embed: Mutex<ServerHandle>,
+    /// Phase 3: per-worker local proxies that authenticate with each remote
+    /// worker before bytes flow. Lifecycle is tied to the chat server: spun
+    /// up in `start`, torn down in `stop`. Owned here (rather than in
+    /// SynapseState) because that's where the lifecycle invariant lives.
+    host_proxy: Arc<HostProxy>,
 }
 
 impl LlamaState {
@@ -65,6 +96,7 @@ impl LlamaState {
         Arc::new(Self {
             chat: Mutex::new(ServerHandle::new(8181)),
             embed: Mutex::new(ServerHandle::new(8182)),
+            host_proxy: HostProxy::new(),
         })
     }
 
@@ -98,6 +130,10 @@ impl LlamaState {
         }
         chat.model_id = None;
         chat.mmproj_id = None;
+        // Phase 3: also free the local proxy ports + tasks. Done here (not in
+        // a separate command) so that "stop model" always means "stop
+        // everything model-related" — no leaked listeners.
+        self.host_proxy.stop_all().await;
         Ok(())
     }
 
@@ -138,18 +174,73 @@ impl LlamaState {
         } else {
             "off"
         });
-        // Synapse: pipeline-shard layers across remote rpc-server workers.
-        // Validated upstream (frontend trims/filters), but we also drop empties
-        // here so a stray comma can't turn into "--rpc ,host:port".
+        // Synapse: pipeline-shard layers across authenticated remote workers.
+        //
+        // Phase 3 routes each worker through a local proxy that handshakes
+        // with the worker's auth_proxy before any rpc bytes flow. We probe
+        // the handshake here BEFORE spawning llama-server — if a token is
+        // wrong or a worker is unreachable, the user sees a clear error
+        // instead of a half-loaded model that can't infer.
+        //
+        // The local addresses we hand to llama-server look like
+        // `127.0.0.1:54712`; the remote IPs/tokens never appear on the
+        // command line, which keeps them out of `ps`/process listings and
+        // any third-party debug tooling that walks argv.
         if let Some(workers) = &settings.synapse_workers {
-            let csv = workers
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(",");
-            if !csv.is_empty() {
-                cmd.arg("--rpc").arg(&csv);
+            let mut local_addrs: Vec<String> = Vec::new();
+            // Track only the workers we successfully started so the
+            // tensor-split list lines up with --rpc devices exactly.
+            let mut active_workers: Vec<&SynapseWorker> = Vec::new();
+            for w in workers {
+                let endpoint = w.endpoint.trim();
+                if endpoint.is_empty() {
+                    continue;
+                }
+                match self.host_proxy.start(app, endpoint, &w.token).await {
+                    Ok(local) => {
+                        local_addrs.push(local);
+                        active_workers.push(w);
+                    }
+                    Err(e) => {
+                        // One bad worker shouldn't strand proxies for the
+                        // good ones — tear them all down before bailing so
+                        // the user gets back to a clean slate.
+                        self.host_proxy.stop_all().await;
+                        return Err(anyhow!("synapse worker {endpoint}: {e}"));
+                    }
+                }
+            }
+            if !local_addrs.is_empty() {
+                cmd.arg("--rpc").arg(local_addrs.join(","));
+
+                // Phase 3 chunk G: build --tensor-split if the user set any
+                // explicit weights. The list goes [host, w1, w2, …] in the
+                // SAME order llama.cpp sees `--rpc` devices. Skipping the
+                // arg entirely (when no weights provided) is intentional —
+                // that lets llama.cpp use its default split heuristic
+                // instead of forcing a probably-wrong number we'd have to
+                // synthesize.
+                let any_explicit = settings.host_weight.is_some()
+                    || active_workers.iter().any(|w| w.weight.is_some());
+                if any_explicit {
+                    let mut weights: Vec<f32> = Vec::with_capacity(active_workers.len() + 1);
+                    weights.push(settings.host_weight.unwrap_or(1.0).max(0.0));
+                    for w in &active_workers {
+                        weights.push(w.weight.unwrap_or(1.0).max(0.0));
+                    }
+                    // Normalize so the user can think in percentages without
+                    // worrying about the sum. llama.cpp accepts comma-
+                    // separated floats; we render with 3 decimals.
+                    let sum: f32 = weights.iter().sum();
+                    if sum > 0.0 {
+                        let csv = weights
+                            .iter()
+                            .map(|w| format!("{:.3}", w / sum))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        cmd.arg("--tensor-split").arg(csv);
+                    }
+                }
             }
         }
 
@@ -251,6 +342,27 @@ fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Phase 3 chunk F1: tok/s parser. llama.cpp's per-request
+                // timing block looks like:
+                //
+                //   eval time = 4321.12 ms /   123 runs   (   34.95 ms per token,    28.62 tokens per second)
+                //
+                // We only care about the chat server (tag=="chat"), and only
+                // about the *eval* line (generation throughput) — `prompt
+                // eval time` is for prefill, which is interesting but
+                // hugely variable depending on context length.
+                if tag == "chat" {
+                    if let Some(tok_per_sec) = parse_eval_tok_per_sec(&line) {
+                        let _ = app.emit(
+                            "synapse:metrics",
+                            serde_json::json!({
+                                "kind": "host-tok-s",
+                                "tokPerSec": tok_per_sec,
+                                "ts": now_ms(),
+                            }),
+                        );
+                    }
+                }
                 let _ = app.emit(
                     "llama:log",
                     serde_json::json!({ "stream": "stderr", "line": line, "tag": tag }),
@@ -258,6 +370,37 @@ fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
             }
         });
     }
+}
+
+/// Extract `tokens per second` from an llama.cpp eval-time log line, e.g.
+/// `eval time = 4321.12 ms / 123 runs ( 34.95 ms per token, 28.62 tokens per second)`.
+/// Returns `None` if the line isn't an eval-time block. We only match `eval time`
+/// (post-decode generation), not `prompt eval time` which is one-shot prefill.
+fn parse_eval_tok_per_sec(line: &str) -> Option<f64> {
+    // Be permissive about whitespace; llama.cpp's spacing has shifted
+    // across versions. We require the literal "eval time" prefix and the
+    // closing "tokens per second" tail with a parsed float between them.
+    let trimmed = line.trim_start();
+    // "prompt eval time" lines start with "prompt", which we want to skip.
+    if !trimmed.starts_with("eval time") {
+        return None;
+    }
+    let lower = line.to_ascii_lowercase();
+    let tail = lower.split("tokens per second").next()?;
+    // Walk back from the tail to find the last comma-separated number.
+    let chunk = tail.rsplit(',').next()?.trim();
+    let num: String = chunk
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    num.parse::<f64>().ok()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) async fn kill_orphan_on_port(port: u16) {
@@ -326,4 +469,34 @@ async fn wait_ready(port: u16) -> Result<()> {
     Err(anyhow!(
         "llama-server did not become ready on port {port} within 3 min"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_eval_tok_per_sec;
+
+    #[test]
+    fn parses_eval_tok_per_sec_real_format() {
+        // Real llama.cpp output, indented (cmake build) and not.
+        let line = "eval time =    4321.12 ms /   123 runs   (   34.95 ms per token,    28.62 tokens per second)";
+        assert!((parse_eval_tok_per_sec(line).unwrap() - 28.62).abs() < 1e-6);
+
+        let indented = "        eval time = 100 ms /  10 runs   ( 10.0 ms per token,   100.00 tokens per second)";
+        assert!((parse_eval_tok_per_sec(indented).unwrap() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skips_prompt_eval_lines() {
+        // Prompt eval is prefill, not generation throughput; we ignore.
+        let line =
+            "prompt eval time = 200 ms /  50 runs   (  4.0 ms per token, 250.00 tokens per second)";
+        assert_eq!(parse_eval_tok_per_sec(line), None);
+    }
+
+    #[test]
+    fn rejects_unrelated_lines() {
+        assert_eq!(parse_eval_tok_per_sec("loading model"), None);
+        assert_eq!(parse_eval_tok_per_sec(""), None);
+        assert_eq!(parse_eval_tok_per_sec("eval time = nope"), None);
+    }
 }

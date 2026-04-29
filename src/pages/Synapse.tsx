@@ -9,11 +9,18 @@ import {
   Radio,
   Server,
   Search,
+  KeyRound,
+  Copy,
+  Check,
+  Eye,
+  EyeOff,
+  Pencil,
 } from "lucide-react";
 import { useApp } from "../lib/store";
 import { api, listen } from "../lib/api";
-import type { SynapsePeer } from "../lib/types";
+import type { SynapseMetric, SynapsePeer, SynapseRtt, SynapseWorker } from "../lib/types";
 import { isTauri } from "../lib/util";
+import { AddPeerDialog } from "../components/AddPeerDialog";
 
 // Live log buffer cap. ~400 lines is enough to scrollback through a model load
 // without eating RAM during long sessions.
@@ -45,13 +52,22 @@ export function Synapse() {
     setSynapseWorkerEnabled,
     setSynapseWorkerPort,
     setSynapseWorkers,
+    setSynapseHostWeight,
   } = useApp();
 
   const [workerBusy, setWorkerBusy] = useState(false);
   const [workerError, setWorkerError] = useState<string | null>(null);
-  // We edit workers as a single textarea string so users can type commas/newlines
-  // freely; on commit we split into the canonical `string[]`.
-  const [workersText, setWorkersText] = useState(synapse.workers.join(", "));
+  // Workers are edited as a single textarea string so users can paste freely.
+  // Phase 3 format per line: `endpoint|token` (e.g. `192.168.1.50:50052|ABC…`).
+  // Bare `endpoint` is also accepted (token defaults to "") so users with
+  // pre-Phase-3 muscle memory aren't blocked, but the next model load will
+  // fail until they paste the real token. Chunk D replaces this textarea
+  // with a proper add-peer dialog.
+  const [workersText, setWorkersText] = useState(
+    synapse.workers
+      .map((w) => (w.token ? `${w.endpoint}|${w.token}` : w.endpoint))
+      .join("\n"),
+  );
 
   // Discovered peers via mDNS. Keyed by peer.id (the mDNS instance name) so
   // duplicates from re-resolution don't double-render.
@@ -61,8 +77,39 @@ export function Synapse() {
   const [autoScroll, setAutoScroll] = useState(true);
   const logBoxRef = useRef<HTMLDivElement>(null);
 
+  // Phase 3 chunk D: this machine's worker token, shown so the user can copy
+  // it onto hosts. We fetch lazily — `get_synapse_token` generates+persists
+  // on first call, so the act of opening this page creates the token even
+  // before worker mode is started. That way hosts can pre-pair.
+  const [myToken, setMyToken] = useState<string | null>(null);
+  const [tokenRevealed, setTokenRevealed] = useState(false);
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const [tokenBusy, setTokenBusy] = useState(false);
+
+  // Add/edit peer dialog state. `target` is null when closed; otherwise it
+  // describes the worker we're configuring. `mode` decides between adding a
+  // new entry vs editing an existing chip's token.
+  type DialogTarget = {
+    endpoint: string;
+    hostname?: string;
+    /** Present when editing an existing worker; absent when adding new. */
+    initialToken?: string;
+  };
+  const [dialogTarget, setDialogTarget] = useState<DialogTarget | null>(null);
+
+  // Phase 3 chunk F: rolling tok/s sparkline samples + per-endpoint RTT.
+  // We bound the sparkline buffer at 30 points (~30 samples spread across
+  // the lifetime of one inference) and keep RTT in a flat record so the
+  // worker chips can lookup by endpoint in O(1).
+  const SPARK_LEN = 30;
+  const [tokPerSecHistory, setTokPerSecHistory] = useState<number[]>([]);
+  const [rttByEndpoint, setRttByEndpoint] = useState<Record<string, SynapseRtt>>({});
+
   // Sync the worker toggle with backend reality on mount — the persisted store
   // can drift from the actual rpc-server child if the app crashed mid-run.
+  // Also fetch the local worker token so hosts can copy it. This generates
+  // the token on first call (idempotent thereafter), so paging through to
+  // Synapse is enough to give every machine a stable identity.
   useEffect(() => {
     if (remote) return;
     api.synapseWorkerStatus()
@@ -78,7 +125,50 @@ export function Synapse() {
         setPeers(next);
       })
       .catch(() => {});
+    api.getSynapseToken().then(setMyToken).catch(() => setMyToken(null));
   }, [remote, setSynapseWorkerEnabled, setSynapseWorkerPort]);
+
+  // Phase 3 chunk E: keep the backend's token map in sync so beacon HMACs can
+  // verify in real time. Pushed on every change to synapse.workers (which
+  // covers add, edit, remove, bulk-paste). Empty tokens are filtered out so
+  // we don't claim to know a token we don't.
+  useEffect(() => {
+    if (remote) return;
+    const map: Record<string, string> = {};
+    for (const w of synapse.workers) {
+      if (w.token) map[w.endpoint] = w.token;
+    }
+    api.setKnownSynapseTokens(map).catch(() => {
+      // Backend not ready yet (very early boot); harmless to drop, the
+      // next workers-change will retry.
+    });
+  }, [remote, synapse.workers]);
+
+  // Phase 3 chunk F: live tok/s + RTT subscriptions. tok/s lands when llama-
+  // server prints an eval-time block (one per generation), RTT lands every
+  // 5s per active host_proxy.
+  useEffect(() => {
+    if (remote) return;
+    let pending: Array<() => void> = [];
+    let cancelled = false;
+
+    listen<SynapseMetric>("synapse:metrics", (m) => {
+      if (m.kind !== "host-tok-s") return;
+      setTokPerSecHistory((prev) => {
+        const next = prev.concat(m.tokPerSec);
+        return next.length > SPARK_LEN ? next.slice(next.length - SPARK_LEN) : next;
+      });
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    listen<SynapseRtt>("synapse:rtt", (r) => {
+      setRttByEndpoint((prev) => ({ ...prev, [r.endpoint]: r }));
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    return () => {
+      cancelled = true;
+      pending.forEach((un) => un());
+    };
+  }, [remote]);
 
   // Subscribe to mDNS peer events. The Rust side starts browsing at app boot,
   // so we just have to hook into the stream — no `start_discovery` to call.
@@ -179,25 +269,123 @@ export function Synapse() {
 
   function commitWorkersText(text: string) {
     setWorkersText(text);
-    const parsed = text
+    const parsed: SynapseWorker[] = text
       .split(/[,\n]/)
       .map((s) => s.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .map((line) => {
+        // Format: `endpoint|token`. Bare `endpoint` accepted with empty
+        // token so users hitting backspace mid-paste don't lose the row
+        // entirely — host_proxy will fail-fast at load time with a clear
+        // "no token configured for X" error.
+        const sep = line.indexOf("|");
+        if (sep === -1) return { endpoint: line, token: "" };
+        return {
+          endpoint: line.slice(0, sep).trim(),
+          token: line.slice(sep + 1).trim(),
+        };
+      });
     setSynapseWorkers(parsed);
   }
 
-  // Add a discovered peer to the workers list with one click. Avoid dupes.
-  function addPeer(p: SynapsePeer) {
-    if (synapse.workers.includes(p.endpoint)) return;
-    const next = [...synapse.workers, p.endpoint];
+  // Serialize the workers list back into the textarea representation.
+  // Centralized so addPeer / removeWorker stay in sync with commitWorkersText.
+  function workersToText(workers: SynapseWorker[]): string {
+    return workers
+      .map((w) => (w.token ? `${w.endpoint}|${w.token}` : w.endpoint))
+      .join("\n");
+  }
+
+  // Click "Use" on a discovered peer → opens the dialog so the user can
+  // paste the worker's token before we save the entry. Adding without a
+  // token is allowed (the chip flags it red) so users hitting cancel still
+  // get a record of the discovery, but loads will fail until they edit.
+  function openAddDialogForPeer(p: SynapsePeer) {
+    if (synapse.workers.some((w) => w.endpoint === p.endpoint)) return;
+    setDialogTarget({ endpoint: p.endpoint, hostname: p.hostname });
+  }
+
+  // Click an existing chip → edit dialog, pre-populated with the current
+  // token so the user can fix or rotate it.
+  function openEditDialogForWorker(w: SynapseWorker) {
+    setDialogTarget({ endpoint: w.endpoint, initialToken: w.token });
+  }
+
+  // Confirm callback for both add + edit. Differentiates by checking whether
+  // an existing worker matches the endpoint — keeps the dialog dumb.
+  function handleDialogConfirm(token: string) {
+    if (!dialogTarget) return;
+    const existing = synapse.workers.find((w) => w.endpoint === dialogTarget.endpoint);
+    let next: SynapseWorker[];
+    if (existing) {
+      next = synapse.workers.map((w) =>
+        w.endpoint === dialogTarget.endpoint ? { ...w, token } : w,
+      );
+    } else {
+      next = [...synapse.workers, { endpoint: dialogTarget.endpoint, token }];
+    }
     setSynapseWorkers(next);
-    setWorkersText(next.join(", "));
+    setWorkersText(workersToText(next));
+    setDialogTarget(null);
   }
 
   function removeWorker(endpoint: string) {
-    const next = synapse.workers.filter((w) => w !== endpoint);
+    const next = synapse.workers.filter((w) => w.endpoint !== endpoint);
     setSynapseWorkers(next);
-    setWorkersText(next.join(", "));
+    setWorkersText(workersToText(next));
+  }
+
+  // Phase 3 chunk G: update one worker's weight in the layer split. Stored
+  // as 0–1 in the SynapseWorker type but presented as 0–100 in the UI.
+  function setWorkerWeight(endpoint: string, value01: number) {
+    const next = synapse.workers.map((w) =>
+      w.endpoint === endpoint ? { ...w, weight: value01 } : w,
+    );
+    setSynapseWorkers(next);
+  }
+
+  // Reset every weight, including host's, back to "use llama.cpp default".
+  function clearAllWeights() {
+    const next = synapse.workers.map((w) => ({ ...w, weight: undefined }));
+    setSynapseWorkers(next);
+    setSynapseHostWeight(undefined);
+  }
+
+  // Token actions — copy + rotate. Rotation is destructive; we confirm
+  // because every paired host needs to re-paste the new value.
+  async function copyToken() {
+    if (!myToken) return;
+    try {
+      await navigator.clipboard.writeText(myToken);
+      setTokenCopied(true);
+      setTimeout(() => setTokenCopied(false), 1500);
+    } catch {
+      // Some sandboxed Tauri webviews block clipboard. Show a fallback
+      // selection by revealing the token if it isn't already.
+      setTokenRevealed(true);
+    }
+  }
+
+  async function rotateToken() {
+    if (!confirm(
+      "Rotate this worker's token? Every host that was previously paired " +
+      "with this machine will need to re-paste the new token before its " +
+      "next model load.",
+    )) {
+      return;
+    }
+    setTokenBusy(true);
+    try {
+      const fresh = await api.rotateSynapseToken();
+      setMyToken(fresh);
+      setTokenRevealed(true);
+    } catch (e) {
+      // Don't blow up — the old token is still valid if rotation failed
+      // (e.g. read-only data dir).
+      console.error("rotate token", e);
+    } finally {
+      setTokenBusy(false);
+    }
   }
 
   const peerList = useMemo(() => Object.values(peers), [peers]);
@@ -294,6 +482,62 @@ export function Synapse() {
               )}
             </div>
           </div>
+
+          {/* Worker token — shown so the user can copy onto hosts. The token
+              exists even before the worker is started; load_or_create spins
+              one up on first read. We hide by default so screenshots /
+              shoulder-surfers don't accidentally leak it. */}
+          <div className="mt-4 pt-4 border-t border-[var(--color-border-soft)]">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <KeyRound size={13} className="text-[var(--color-accent)]" />
+                Worker token
+              </div>
+              <span className="text-[11px] text-[var(--color-text-subtle)]">
+                Hosts paste this once, per worker
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2">
+              <code className="flex-1 text-[13px] font-mono truncate select-all">
+                {myToken
+                  ? tokenRevealed
+                    ? myToken
+                    : "•".repeat(Math.min(myToken.length, 52))
+                  : "loading…"}
+              </code>
+              <button
+                onClick={() => setTokenRevealed((v) => !v)}
+                className="text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                title={tokenRevealed ? "Hide" : "Reveal"}
+              >
+                {tokenRevealed ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+              <button
+                onClick={copyToken}
+                className="text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                title="Copy"
+                disabled={!myToken}
+              >
+                {tokenCopied ? (
+                  <Check size={14} className="text-[var(--color-success)]" />
+                ) : (
+                  <Copy size={14} />
+                )}
+              </button>
+              <button
+                onClick={rotateToken}
+                disabled={tokenBusy || !myToken}
+                className="text-[var(--color-text-muted)] hover:text-[var(--color-danger)] disabled:opacity-50"
+                title="Rotate (paired hosts will need the new token)"
+              >
+                <RefreshCw size={14} className={tokenBusy ? "animate-spin" : ""} />
+              </button>
+            </div>
+            <div className="text-[11px] text-[var(--color-text-subtle)] mt-1.5 leading-snug">
+              The token authenticates connections to this worker. Anyone who has it can
+              run inference on your hardware — share carefully.
+            </div>
+          </div>
         </Section>
 
         {/* Discovered peers */}
@@ -313,7 +557,7 @@ export function Synapse() {
           ) : (
             <ul className="flex flex-col gap-1.5">
               {peerList.map((p) => {
-                const added = synapse.workers.includes(p.endpoint);
+                const added = synapse.workers.some((w) => w.endpoint === p.endpoint);
                 return (
                   <li
                     key={p.id}
@@ -321,13 +565,33 @@ export function Synapse() {
                   >
                     <div className="w-1.5 h-1.5 rounded-full bg-[var(--color-success)]" />
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">{p.hostname}</div>
+                      <div className="text-sm font-medium truncate flex items-center gap-1.5">
+                        {p.hostname}
+                        {/* HMAC-verified beacon: green check.
+                            No token yet:           amber warning.
+                            We use the icon-only treatment to keep the row tight. */}
+                        {p.verified ? (
+                          <span
+                            title="Beacon verified — token matches"
+                            className="text-[var(--color-success)] flex items-center"
+                          >
+                            <Check size={12} />
+                          </span>
+                        ) : (
+                          <span
+                            title="Unverified — add the worker token to authenticate"
+                            className="text-[var(--color-text-subtle)] text-[10px] uppercase tracking-wider"
+                          >
+                            unverified
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-[var(--color-text-muted)] font-mono truncate">
                         {p.endpoint}
                       </div>
                     </div>
                     <button
-                      onClick={() => addPeer(p)}
+                      onClick={() => openAddDialogForPeer(p)}
                       disabled={added}
                       className={`text-xs px-2.5 py-1 rounded-md border flex items-center gap-1 ${
                         added
@@ -346,36 +610,196 @@ export function Synapse() {
 
         {/* Workers list (host side) */}
         <Section title="Workers (this machine is the host)" icon={<Network size={15} />}>
-          <div className="text-xs text-[var(--color-text-muted)] mb-2">
-            Comma- or newline-separated <code>host:port</code>. Applied on the next model
-            load. Leave empty to run only on this machine.
+          <div className="flex items-start justify-between mb-2 gap-3">
+            <div className="text-xs text-[var(--color-text-muted)] flex-1">
+              Each entry needs the worker's token. Use <Plus size={11} className="inline -mt-0.5" /> on
+              a discovered peer above, or <span className="text-[var(--color-text)]">Add manually</span> for
+              workers that aren't broadcasting. Applied on the next model load.
+            </div>
+            <button
+              onClick={() => {
+                const endpoint = prompt(
+                  "Worker endpoint (host:port)",
+                  "192.168.1.50:50052",
+                );
+                if (!endpoint) return;
+                const trimmed = endpoint.trim();
+                if (!trimmed) return;
+                if (synapse.workers.some((w) => w.endpoint === trimmed)) return;
+                setDialogTarget({ endpoint: trimmed });
+              }}
+              className="text-xs px-2.5 py-1 rounded-md bg-[var(--color-panel-2)] border border-[var(--color-border)] hover:border-[var(--color-accent)]/60 flex items-center gap-1 shrink-0"
+            >
+              <Plus size={11} /> Add manually
+            </button>
           </div>
-          <textarea
-            value={workersText}
-            onChange={(e) => commitWorkersText(e.target.value)}
-            placeholder="192.168.1.50:50052, mac-mini.local:50052"
-            rows={3}
-            className="w-full text-sm font-mono bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-md px-3 py-2 placeholder:text-[var(--color-text-subtle)]"
-          />
-          {synapse.workers.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-1.5">
-              {synapse.workers.map((w) => (
-                <span
-                  key={w}
-                  className="text-xs font-mono bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-full pl-2.5 pr-1 py-0.5 flex items-center gap-1"
-                >
-                  {w}
-                  <button
-                    onClick={() => removeWorker(w)}
-                    className="text-[var(--color-text-subtle)] hover:text-[var(--color-danger)] rounded-full w-4 h-4 grid place-items-center"
-                    title="Remove worker"
+
+          {synapse.workers.length === 0 ? (
+            <div className="text-xs text-[var(--color-text-subtle)] py-3">
+              No workers configured — this machine will run models on its own hardware.
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {synapse.workers.map((w) => {
+                const missingToken = !w.token;
+                const rtt = rttByEndpoint[w.endpoint];
+                // RTT colour bands match common networking expectations:
+                //   <50 ms green (LAN healthy), 50–200 ms amber (Wi-Fi
+                //   contention), >200 ms red (VPN / WAN / dropping).
+                let rttClass = "text-[var(--color-text-subtle)]";
+                if (rtt && rtt.ok) {
+                  if (rtt.rttMs < 50) rttClass = "text-[var(--color-success)]";
+                  else if (rtt.rttMs < 200) rttClass = "text-yellow-400";
+                  else rttClass = "text-[var(--color-danger)]";
+                } else if (rtt && !rtt.ok) {
+                  rttClass = "text-[var(--color-danger)]";
+                }
+                return (
+                  <span
+                    key={w.endpoint}
+                    title={
+                      missingToken
+                        ? "No token — model load will fail. Click ✎ to add it."
+                        : "Click ✎ to update the token"
+                    }
+                    className={`text-xs font-mono border rounded-full pl-2.5 pr-1 py-0.5 flex items-center gap-1 ${
+                      missingToken
+                        ? "bg-[var(--color-danger)]/10 border-[var(--color-danger)]/40"
+                        : "bg-[var(--color-panel-2)] border-[var(--color-border)]"
+                    }`}
                   >
-                    ×
-                  </button>
-                </span>
-              ))}
+                    {w.endpoint}
+                    {rtt && (
+                      <span className={`text-[10px] ${rttClass}`}>
+                        {rtt.ok ? `${rtt.rttMs}ms` : "drop"}
+                      </span>
+                    )}
+                    {missingToken && (
+                      <span className="text-[var(--color-danger)] text-[10px] uppercase tracking-wider">
+                        no token
+                      </span>
+                    )}
+                    <button
+                      onClick={() => openEditDialogForWorker(w)}
+                      className="text-[var(--color-text-subtle)] hover:text-[var(--color-text)] rounded-full w-4 h-4 grid place-items-center"
+                      title="Edit token"
+                    >
+                      <Pencil size={10} />
+                    </button>
+                    <button
+                      onClick={() => removeWorker(w.endpoint)}
+                      className="text-[var(--color-text-subtle)] hover:text-[var(--color-danger)] rounded-full w-4 h-4 grid place-items-center"
+                      title="Remove worker"
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })}
             </div>
           )}
+
+          {/* Inference throughput readout. Only visible after llama-server has
+              actually completed at least one generation (we have data). The
+              sparkline gives shape to the recent trend at a glance. */}
+          {tokPerSecHistory.length > 0 && (
+            <div className="mt-4 flex items-center gap-3 rounded-md bg-[var(--color-panel-2)] border border-[var(--color-border)] px-3 py-2">
+              <div className="flex flex-col">
+                <span className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)]">
+                  Throughput
+                </span>
+                <span className="text-sm font-mono">
+                  {tokPerSecHistory[tokPerSecHistory.length - 1].toFixed(1)} tok/s
+                </span>
+              </div>
+              <Sparkline values={tokPerSecHistory} />
+              <span className="text-[11px] text-[var(--color-text-subtle)] ml-auto">
+                last {tokPerSecHistory.length} generations
+              </span>
+            </div>
+          )}
+
+          {/* Layer split (--tensor-split). Lets users override llama.cpp's
+              even-split default — important when host and worker have very
+              different compute (e.g. M1 Pro host + 4090 worker → most layers
+              should land on the 4090). Hidden in <details> so the common
+              case (default split) doesn't get cluttered with sliders. */}
+          {synapse.workers.length > 0 && (() => {
+            // Compute display percentages from the explicit weights. Sliders
+            // bind to raw 0–100 values; we do the normalization to a sum of
+            // 1.0 in the backend when building --tensor-split.
+            const hostW = synapse.hostWeight ?? 0;
+            const workerWs = synapse.workers.map((w) => w.weight ?? 0);
+            const total = hostW + workerWs.reduce((a, b) => a + b, 0);
+            const pct = (v: number) =>
+              total > 0 ? Math.round((v / total) * 100) : 0;
+            const anyExplicit =
+              synapse.hostWeight !== undefined ||
+              synapse.workers.some((w) => w.weight !== undefined);
+            return (
+              <details className="mt-4 group" open={anyExplicit}>
+                <summary className="text-xs text-[var(--color-text-muted)] cursor-pointer select-none hover:text-[var(--color-text)] flex items-center justify-between">
+                  <span>
+                    Layer split{" "}
+                    <span className="text-[var(--color-text-subtle)]">
+                      ({anyExplicit ? "custom" : "auto"})
+                    </span>
+                  </span>
+                  {anyExplicit && (
+                    <button
+                      onClick={(e) => {
+                        e.preventDefault();
+                        clearAllWeights();
+                      }}
+                      className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)] hover:text-[var(--color-text)]"
+                    >
+                      reset
+                    </button>
+                  )}
+                </summary>
+                <div className="mt-2 flex flex-col gap-2">
+                  <SplitSlider
+                    label="This machine (host)"
+                    value01={synapse.hostWeight ?? 0.5}
+                    pct={anyExplicit ? pct(hostW) : null}
+                    onChange={(v) => setSynapseHostWeight(v)}
+                  />
+                  {synapse.workers.map((w, i) => (
+                    <SplitSlider
+                      key={w.endpoint}
+                      label={w.endpoint}
+                      value01={w.weight ?? 0.5}
+                      pct={anyExplicit ? pct(workerWs[i]) : null}
+                      onChange={(v) => setWorkerWeight(w.endpoint, v)}
+                    />
+                  ))}
+                  <div className="text-[11px] text-[var(--color-text-subtle)] mt-1 leading-snug">
+                    Higher = more layers on that device. Values are normalized
+                    to a fraction; the actual layer count is rounded to the
+                    nearest integer at load time. Reset to fall back to
+                    llama.cpp's default heuristic.
+                  </div>
+                </div>
+              </details>
+            );
+          })()}
+
+          {/* Power-user textarea: bulk paste in `endpoint|token` format. Kept
+              for discoverability of the format and for hosts that want to
+              import many workers at once. The chips above are the primary
+              UI; this is the escape hatch. */}
+          <details className="mt-4 group">
+            <summary className="text-xs text-[var(--color-text-muted)] cursor-pointer select-none hover:text-[var(--color-text)]">
+              Bulk import (endpoint|token per line)
+            </summary>
+            <textarea
+              value={workersText}
+              onChange={(e) => commitWorkersText(e.target.value)}
+              placeholder={"192.168.1.50:50052|ABCD…\nmac-mini.local:50052|EFGH…"}
+              rows={3}
+              className="mt-2 w-full text-sm font-mono bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-md px-3 py-2 placeholder:text-[var(--color-text-subtle)]"
+            />
+          </details>
         </Section>
 
         {/* Live logs */}
@@ -452,6 +876,15 @@ export function Synapse() {
           </div>
         </Section>
       </div>
+
+      <AddPeerDialog
+        open={dialogTarget !== null}
+        endpoint={dialogTarget?.endpoint ?? ""}
+        hostname={dialogTarget?.hostname}
+        initialToken={dialogTarget?.initialToken}
+        onCancel={() => setDialogTarget(null)}
+        onConfirm={handleDialogConfirm}
+      />
     </div>
   );
 }
@@ -473,5 +906,91 @@ function Section({
       </div>
       {children}
     </div>
+  );
+}
+
+/// One row of the layer-split editor: label + slider + computed %. The slider
+/// binds to a raw 0–1 weight; normalization to a sum of 1 happens in the
+/// backend so the UI doesn't have to coordinate state across N rows.
+function SplitSlider({
+  label,
+  value01,
+  pct,
+  onChange,
+}: {
+  label: string;
+  value01: number;
+  pct: number | null;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="grid grid-cols-[1fr_auto] items-center gap-2 text-xs">
+      <div className="flex items-center justify-between gap-2 min-w-0">
+        <span className="font-mono truncate">{label}</span>
+        <span className="text-[var(--color-text-subtle)] tabular-nums shrink-0">
+          {pct === null ? "auto" : `${pct}%`}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.01}
+        value={value01}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-[200px] accent-[var(--color-accent)]"
+      />
+    </label>
+  );
+}
+
+/// Tiny inline SVG sparkline. Avoids a charting dep — we only need a
+/// 30-point line for the tok/s feed. Auto-scales y to the visible range.
+function Sparkline({
+  values,
+  width = 120,
+  height = 28,
+}: {
+  values: number[];
+  width?: number;
+  height?: number;
+}) {
+  if (values.length < 2) {
+    return (
+      <div
+        style={{ width, height }}
+        className="grid place-items-center text-[10px] text-[var(--color-text-subtle)]"
+      >
+        waiting…
+      </div>
+    );
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  // Pad so a flat line still has visible thickness.
+  const pad = max === min ? 1 : (max - min) * 0.1;
+  const lo = min - pad;
+  const hi = max + pad;
+  const span = hi - lo;
+  const dx = width / (values.length - 1);
+  const points = values
+    .map((v, i) => {
+      const x = i * dx;
+      const y = height - ((v - lo) / span) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg width={width} height={height} className="block">
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={points}
+        className="text-[var(--color-accent)]"
+      />
+    </svg>
   );
 }

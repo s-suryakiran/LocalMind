@@ -1,8 +1,3 @@
-// Phase 3 chunk A foundation; consumed by chunks B/C/E. See synapse_proto
-// for matching note. Module-level allow keeps CI green during the chunked
-// rollout — will be removed once the proxy + host pool actually call in.
-#![allow(dead_code)]
-
 // Persisted Synapse worker token. Generated on first call, then reused
 // across app restarts so a paired host doesn't have to re-pair every time
 // the worker reboots. The file lives at `<data_dir>/synapse-token.txt`.

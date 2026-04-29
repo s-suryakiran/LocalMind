@@ -28,7 +28,12 @@ export function Models() {
       ? (mmprojs.find((m) => m.repo === model.repo) ?? mmprojs[0])?.id
       : undefined;
     const synapseWorkers = synapse.workers.length > 0 ? synapse.workers : undefined;
-    const s = await api.startLlama({ modelId: id, mmprojId, synapseWorkers });
+    const s = await api.startLlama({
+      modelId: id,
+      mmprojId,
+      synapseWorkers,
+      hostWeight: synapse.hostWeight,
+    });
     setLlama(s);
   }
 

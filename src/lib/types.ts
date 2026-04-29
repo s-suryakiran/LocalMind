@@ -59,6 +59,18 @@ export interface LlamaStatus {
   embeddingModelId: string | null;
 }
 
+/** A single Synapse worker the host wants to pipeline-shard layers onto.
+ *  Each worker has its own token (shown in the worker's Synapse UI) that
+ *  the host's local proxy uses to authenticate. */
+export interface SynapseWorker {
+  endpoint: string;
+  token: string;
+  /** Phase 3 chunk G: relative compute weight (0–1). When any worker has a
+   *  weight set, the host passes `--tensor-split` so layers split by ratio
+   *  instead of evenly. Undefined keeps llama.cpp's default heuristic. */
+  weight?: number;
+}
+
 export interface LlamaSettings {
   modelId: string;
   contextSize?: number;
@@ -67,8 +79,13 @@ export interface LlamaSettings {
   port?: number;
   mmprojId?: string;
   flashAttn?: boolean;
-  /** Synapse: comma-separated `host:port` workers to pipeline-shard layers across. */
-  synapseWorkers?: string[];
+  /** Synapse workers to pipeline-shard layers across.
+   *  Phase 3: each entry needs a token; the local proxy uses it for the
+   *  handshake with the worker's auth proxy before any rpc bytes flow. */
+  synapseWorkers?: SynapseWorker[];
+  /** Phase 3 chunk G: host's relative weight in the layer split (0–1).
+   *  Combined with each worker's `weight` to build `--tensor-split`. */
+  hostWeight?: number;
 }
 
 export interface SynapseWorkerStatus {
@@ -84,6 +101,27 @@ export interface SynapsePeer {
   port: number;
   /** `address:port` — paste-ready for the workers list. */
   endpoint: string;
+  /** True iff the host has the worker's token AND the beacon's HMAC verifies.
+   *  Hosts who haven't paired yet always see false; pair via the dialog and
+   *  the next set_known_synapse_tokens call flips this on the cached entry. */
+  verified: boolean;
+}
+
+/** synapse:metrics event payload — emitted by the chat llama-server's stderr
+ *  parser whenever an `eval time` line lands. tokPerSec is the most recent
+ *  generation throughput, host-side aggregate (all workers + host combined). */
+export interface SynapseMetric {
+  kind: "host-tok-s";
+  tokPerSec: number;
+  ts: number;
+}
+
+/** synapse:rtt event payload — emitted by each host_proxy's pinger every 5s. */
+export interface SynapseRtt {
+  endpoint: string;
+  rttMs: number;
+  ok: boolean;
+  ts: number;
 }
 
 export interface ModelDownloadProgress {

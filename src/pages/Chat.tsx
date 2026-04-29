@@ -76,7 +76,12 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
       return;
     }
     const synapseWorkers = synapse.workers.length > 0 ? synapse.workers : undefined;
-    const status = await api.startLlama({ modelId, mmprojId: wantMmproj, synapseWorkers });
+    const status = await api.startLlama({
+      modelId,
+      mmprojId: wantMmproj,
+      synapseWorkers,
+      hostWeight: synapse.hostWeight,
+    });
     setLlama(status);
   }
 
