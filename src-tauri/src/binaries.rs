@@ -181,7 +181,9 @@ pub async fn ensure_llama_server(app: &AppHandle) -> Result<PathBuf> {
         // sibling cudart-*.zip exactly. Mismatched versions silently fail at
         // LoadLibrary time.
         let cuda_version = extract_cuda_version(&name);
-        if let Err(e) = ensure_cuda_runtime(app, &client, assets, &target_dir, cuda_version.as_deref()).await {
+        if let Err(e) =
+            ensure_cuda_runtime(app, &client, assets, &target_dir, cuda_version.as_deref()).await
+        {
             // Best-effort — log but don't fail the install. The user gets a
             // working CPU fallback either way; without this hint they'd just
             // wonder why their GPU is idle.
