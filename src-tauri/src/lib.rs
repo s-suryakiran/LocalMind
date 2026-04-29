@@ -7,6 +7,8 @@ mod rag;
 mod sd;
 mod server;
 mod synapse;
+mod synapse_proto;
+mod synapse_token;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
 use models::{InstalledModel, ModelKind, ModelListing};
