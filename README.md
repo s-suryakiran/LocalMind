@@ -25,13 +25,14 @@ LocalMind is a desktop app that runs open-source language models locally and exp
 ## Features
 
 - 🧠 **Local chat** — streaming responses from any GGUF model via [llama.cpp](https://github.com/ggerganov/llama.cpp). Auto-detects Metal / CUDA / Vulkan and picks the right backend.
-- 🛒 **Built-in marketplace** — search and one-click download GGUF models from Hugging Face directly in-app.
+- 🛒 **Built-in marketplace** — search and one-click download GGUF models from Hugging Face directly in-app. Models too big for one machine get a **Needs Synapse** badge with a link to the cluster setup.
 - 📚 **RAG over your docs** — drop PDFs / text into the Knowledge tab, get citations alongside answers (uses `nomic-embed-text` by default).
 - 👁️ **Vision** — bring your own LLaVA / vision-language model + projector, attach images in chat.
 - 🎨 **Image generation** — bundled `stable-diffusion.cpp`; generate locally with FLUX / SD models.
 - 🎙️ **Voice** — Web Speech API for input and TTS playback. No cloud round-trip.
+- 🕸️ **Synapse — pool LAN machines** — run models that don't fit on one device by pipeline-sharding layers across multiple computers on your Wi-Fi. Auto-discovery (mDNS + UDP beacon fallback), token-gated auth proxy, HMAC-signed beacons, live tok/s + per-worker RTT, manual layer-split sliders. See [Synapse](#synapse--pool-machines-on-your-lan).
 - 📱 **Phone PWA** — pair an iPhone or Android with a 6-digit PIN, "Add to Home Screen", chat with the model running on your computer from anywhere on your Wi-Fi.
-- 🔒 **Private by default** — embedded Axum LAN server only listens on your local network and requires a paired bearer token for any API call.
+- 🔒 **Private by default** — embedded Axum LAN server only listens on your local network and requires a paired bearer token for any API call. Synapse workers reject any client without the per-worker token.
 
 ## Screenshots
 
