@@ -316,6 +316,12 @@ fn generate_pin() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // rustls 0.23 sees both `ring` and `aws-lc-rs` providers via transitive
+    // deps (reqwest's rustls-tls pulls hyper-rustls which enables aws-lc-rs).
+    // With both features on, rustls refuses to auto-pick one and panics on
+    // first TLS use. Pin ring explicitly. Err on re-entry is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let llama = LlamaState::new();
     let rag = RagState::new();
     let sd = SdState::new();

@@ -25,6 +25,17 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, S
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::sync::Arc;
+use std::sync::Once;
+
+/// Belt-and-suspenders for the rustls crypto provider. `lib::run()` calls
+/// `install_default` at startup, but if any TLS path is reached before that
+/// (or in a test that bypasses `run()`), this guarantees a provider is set.
+fn ensure_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// Load the worker's cert + key, generating them on first call. Idempotent:
 /// reads the same files on every subsequent call. Returns the parsed DER
@@ -86,6 +97,7 @@ pub fn server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig> {
+    ensure_crypto_provider();
     // We reject client certs entirely; build an empty store.
     let _empty_roots = RootCertStore::empty();
     let _no_client_verifier = WebPkiClientVerifier::no_client_auth();
@@ -99,6 +111,7 @@ pub fn server_config(
 /// by `host_proxy` when dialing a worker — the host has the worker's
 /// fingerprint from the verified beacon and refuses anything else.
 pub fn client_config_pinning(expected_fingerprint_hex: String) -> Result<ClientConfig> {
+    ensure_crypto_provider();
     let verifier = Arc::new(PinnedFingerprintVerifier {
         expected: expected_fingerprint_hex.to_ascii_lowercase(),
     });
