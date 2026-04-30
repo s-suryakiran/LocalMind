@@ -17,8 +17,14 @@ import {
   Pencil,
 } from "lucide-react";
 import { useApp } from "../lib/store";
-import { api, listen } from "../lib/api";
-import type { SynapseMetric, SynapsePeer, SynapseRtt, SynapseWorker } from "../lib/types";
+import { api, listen, remoteSynapse } from "../lib/api";
+import type {
+  SynapseClusterLayout,
+  SynapseMetric,
+  SynapsePeer,
+  SynapseRtt,
+  SynapseWorker,
+} from "../lib/types";
 import { isTauri } from "../lib/util";
 import { AddPeerDialog } from "../components/AddPeerDialog";
 
@@ -94,6 +100,10 @@ export function Synapse() {
     hostname?: string;
     /** Present when editing an existing worker; absent when adding new. */
     initialToken?: string;
+    /** Phase 4 chunk N: pinned cert fingerprint (when adding from a
+     *  verified beacon) or pre-populated when editing a worker that
+     *  already has one stored. */
+    certFingerprint?: string;
   };
   const [dialogTarget, setDialogTarget] = useState<DialogTarget | null>(null);
 
@@ -104,6 +114,18 @@ export function Synapse() {
   const SPARK_LEN = 30;
   const [tokPerSecHistory, setTokPerSecHistory] = useState<number[]>([]);
   const [rttByEndpoint, setRttByEndpoint] = useState<Record<string, SynapseRtt>>({});
+  // Phase 4 chunk I: track which workers the heartbeat has evicted. A
+  // recovered event clears the entry. Stored as a Set so chip-render is
+  // an O(1) `.has()`.
+  const [evictedEndpoints, setEvictedEndpoints] = useState<Set<string>>(new Set());
+  // Phase 4 chunk O: live count of authenticated hosts connected to *this
+  // machine's* worker. Updates on every accept/disconnect via
+  // `synapse:sessions`. Only meaningful when worker mode is enabled.
+  const [activeSessions, setActiveSessions] = useState(0);
+  // Phase 4 chunk Q: layer-distribution snapshot from the most recent
+  // model load. We only display the most recent — older snapshots are
+  // stale once the model is reloaded with a different split.
+  const [clusterLayout, setClusterLayout] = useState<SynapseClusterLayout | null>(null);
 
   // Sync the worker toggle with backend reality on mount — the persisted store
   // can drift from the actual rpc-server child if the app crashed mid-run.
@@ -126,6 +148,9 @@ export function Synapse() {
       })
       .catch(() => {});
     api.getSynapseToken().then(setMyToken).catch(() => setMyToken(null));
+    // Phase 4 chunk O: cold-read the session count on mount in case the
+    // page (re-)opens with hosts already connected.
+    api.synapseActiveSessions().then(setActiveSessions).catch(() => {});
   }, [remote, setSynapseWorkerEnabled, setSynapseWorkerPort]);
 
   // Phase 3 chunk E: keep the backend's token map in sync so beacon HMACs can
@@ -162,6 +187,32 @@ export function Synapse() {
 
     listen<SynapseRtt>("synapse:rtt", (r) => {
       setRttByEndpoint((prev) => ({ ...prev, [r.endpoint]: r }));
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    listen<{ endpoint: string }>("synapse:proxy-evicted", (e) => {
+      setEvictedEndpoints((prev) => {
+        if (prev.has(e.endpoint)) return prev;
+        const next = new Set(prev);
+        next.add(e.endpoint);
+        return next;
+      });
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    listen<{ endpoint: string }>("synapse:proxy-recovered", (e) => {
+      setEvictedEndpoints((prev) => {
+        if (!prev.has(e.endpoint)) return prev;
+        const next = new Set(prev);
+        next.delete(e.endpoint);
+        return next;
+      });
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    listen<{ count: number }>("synapse:sessions", (e) => {
+      setActiveSessions(e.count);
+    }).then((un) => { if (cancelled) un(); else pending.push(un); });
+
+    listen<SynapseClusterLayout>("synapse:cluster-layout", (l) => {
+      setClusterLayout(l);
     }).then((un) => { if (cancelled) un(); else pending.push(un); });
 
     return () => {
@@ -300,9 +351,19 @@ export function Synapse() {
   // paste the worker's token before we save the entry. Adding without a
   // token is allowed (the chip flags it red) so users hitting cancel still
   // get a record of the discovery, but loads will fail until they edit.
+  //
+  // Phase 4 chunk N: capture the cert fingerprint from the (HMAC-signed)
+  // beacon at pair time, stored alongside the token. The host's TLS
+  // verifier then pins this exact fingerprint on every connect — a peer
+  // at the same IP can't impersonate the worker even if it learns the
+  // token.
   function openAddDialogForPeer(p: SynapsePeer) {
     if (synapse.workers.some((w) => w.endpoint === p.endpoint)) return;
-    setDialogTarget({ endpoint: p.endpoint, hostname: p.hostname });
+    setDialogTarget({
+      endpoint: p.endpoint,
+      hostname: p.hostname,
+      certFingerprint: p.certFingerprint,
+    });
   }
 
   // Click an existing chip → edit dialog, pre-populated with the current
@@ -318,11 +379,21 @@ export function Synapse() {
     const existing = synapse.workers.find((w) => w.endpoint === dialogTarget.endpoint);
     let next: SynapseWorker[];
     if (existing) {
+      // Edit-mode preserves whatever fingerprint was stored before; the
+      // dialog only edits the token. Re-pairing fully (re-running
+      // openAddDialogForPeer) is the way to refresh the fingerprint.
       next = synapse.workers.map((w) =>
         w.endpoint === dialogTarget.endpoint ? { ...w, token } : w,
       );
     } else {
-      next = [...synapse.workers, { endpoint: dialogTarget.endpoint, token }];
+      next = [
+        ...synapse.workers,
+        {
+          endpoint: dialogTarget.endpoint,
+          token,
+          certFingerprint: dialogTarget.certFingerprint,
+        },
+      ];
     }
     setSynapseWorkers(next);
     setWorkersText(workersToText(next));
@@ -349,6 +420,46 @@ export function Synapse() {
     const next = synapse.workers.map((w) => ({ ...w, weight: undefined }));
     setSynapseWorkers(next);
     setSynapseHostWeight(undefined);
+  }
+
+  // Phase 4 chunk L: pre-fill the layer split using each device's
+  // advertised VRAM. A real benchmark-tuned split would need to load the
+  // model under several configurations and measure tok/s — costly and
+  // tedious. VRAM-proportional is a strong heuristic for pipeline-parallel
+  // inference with similar bandwidth on each link, which is the common
+  // case on a home LAN.
+  //
+  // Host VRAM is read from `hardware`; peer VRAM from the latest beacon
+  // (cached in `peers`). Devices we can't read fall back to a 4 GB equal
+  // share so they aren't accidentally weighted to zero.
+  function suggestSplitFromVram() {
+    const hardware = useApp.getState().hardware;
+    let hostGb = 4;
+    if (hardware) {
+      const acc = hardware.accelerator;
+      if (acc.type === "appleSilicon") hostGb = acc.unifiedMemoryGb * 0.75;
+      else if (acc.type === "nvidia") hostGb = acc.vramGb;
+      else if (acc.type === "amd") hostGb = acc.vramGb;
+      else hostGb = Math.max(1, hardware.totalMemoryGb - 4);
+    }
+    // peers is keyed by mDNS instance id, but we want to look up by
+    // endpoint (host:port). Build a once-per-call index so each worker
+    // lookup stays O(1).
+    const peerByEndpoint: Record<string, SynapsePeer> = {};
+    for (const p of Object.values(peers)) peerByEndpoint[p.endpoint] = p;
+    const peerGbs = synapse.workers.map((w) => peerByEndpoint[w.endpoint]?.vramGb ?? 4);
+    // Normalize to the 0–1 range the SplitSlider binds to. We rescale so
+    // the largest device sits at 1.0; everything else is proportional.
+    // The backend re-normalizes again at --tensor-split build time, so
+    // only the *ratio* between values matters for inference — the
+    // absolute scale is purely cosmetic.
+    const max = Math.max(hostGb, ...peerGbs, 1);
+    const nextWorkers = synapse.workers.map((w, i) => ({
+      ...w,
+      weight: peerGbs[i] / max,
+    }));
+    setSynapseWorkers(nextWorkers);
+    setSynapseHostWeight(hostGb / max);
   }
 
   // Token actions — copy + rotate. Rotation is destructive; we confirm
@@ -395,16 +506,11 @@ export function Synapse() {
   );
 
   if (remote) {
-    // Phone/PWA — Synapse is desktop-only since it spawns child processes.
-    return (
-      <div className="flex flex-col h-full items-center justify-center text-center px-6">
-        <Network size={28} className="text-[var(--color-text-muted)] mb-3" />
-        <p className="text-sm text-[var(--color-text-muted)] max-w-sm">
-          Synapse runs on the desktop host — open LocalMind on the paired Mac/PC to
-          manage workers and peers.
-        </p>
-      </div>
-    );
+    // Phone/PWA — Phase 4 chunk P: read-only Synapse viewer. Fetches the
+    // desktop's worker status and discovered peers via the LAN API. We
+    // can't drive worker mode or edit tokens from here (desktop-only),
+    // but the diagnostic surface is identical.
+    return <RemoteSynapseView />;
   }
 
   return (
@@ -434,7 +540,22 @@ export function Synapse() {
             <div className="flex-1">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <div className="text-sm font-medium">Run as a Synapse worker</div>
+                  <div className="text-sm font-medium flex items-center gap-2">
+                    Run as a Synapse worker
+                    {/* Phase 4 chunk O: live "N hosts connected" pill.
+                        Only shown when the worker is on AND at least one
+                        host is actually paired-and-active — a 0-count
+                        running worker is the steady-state idle case and
+                        the badge would just be visual noise. */}
+                    {synapse.workerEnabled && activeSessions > 0 && (
+                      <span
+                        title="Authenticated hosts currently connected"
+                        className="text-[10px] uppercase tracking-wider text-[var(--color-success)] bg-[var(--color-success)]/10 border border-[var(--color-success)]/40 rounded-full px-2 py-0.5"
+                      >
+                        {activeSessions} host{activeSessions === 1 ? "" : "s"}
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-[var(--color-text-muted)] mt-0.5">
                     Spawns <code>rpc-server</code> and announces this machine on the LAN
                     via mDNS so other LocalMind hosts can find it automatically.
@@ -589,6 +710,17 @@ export function Synapse() {
                       <div className="text-xs text-[var(--color-text-muted)] font-mono truncate">
                         {p.endpoint}
                       </div>
+                      {/* Phase 4 chunk J: hardware blurb. We show it when
+                          available because users picking between two peers
+                          on the same LAN almost always want to know which
+                          has more VRAM. Hidden gracefully on pre-Phase-4
+                          workers where the fields are undefined. */}
+                      {(p.acceleratorName || p.vramGb) && (
+                        <div className="text-[11px] text-[var(--color-text-subtle)] truncate">
+                          {p.acceleratorName ?? "unknown"}
+                          {p.vramGb ? ` · ${p.vramGb.toFixed(1)} GB` : ""}
+                        </div>
+                      )}
                     </div>
                     <button
                       onClick={() => openAddDialogForPeer(p)}
@@ -643,6 +775,7 @@ export function Synapse() {
               {synapse.workers.map((w) => {
                 const missingToken = !w.token;
                 const rtt = rttByEndpoint[w.endpoint];
+                const evicted = evictedEndpoints.has(w.endpoint);
                 // RTT colour bands match common networking expectations:
                 //   <50 ms green (LAN healthy), 50–200 ms amber (Wi-Fi
                 //   contention), >200 ms red (VPN / WAN / dropping).
@@ -658,23 +791,32 @@ export function Synapse() {
                   <span
                     key={w.endpoint}
                     title={
-                      missingToken
-                        ? "No token — model load will fail. Click ✎ to add it."
-                        : "Click ✎ to update the token"
+                      evicted
+                        ? "Worker unreachable — heartbeat failed. Will auto-recover when the worker comes back."
+                        : missingToken
+                          ? "No token — model load will fail. Click ✎ to add it."
+                          : "Click ✎ to update the token"
                     }
                     className={`text-xs font-mono border rounded-full pl-2.5 pr-1 py-0.5 flex items-center gap-1 ${
-                      missingToken
-                        ? "bg-[var(--color-danger)]/10 border-[var(--color-danger)]/40"
-                        : "bg-[var(--color-panel-2)] border-[var(--color-border)]"
+                      evicted
+                        ? "bg-[var(--color-panel-2)] border-[var(--color-border)] opacity-60"
+                        : missingToken
+                          ? "bg-[var(--color-danger)]/10 border-[var(--color-danger)]/40"
+                          : "bg-[var(--color-panel-2)] border-[var(--color-border)]"
                     }`}
                   >
                     {w.endpoint}
-                    {rtt && (
+                    {evicted && (
+                      <span className="text-[var(--color-danger)] text-[10px] uppercase tracking-wider">
+                        offline
+                      </span>
+                    )}
+                    {!evicted && rtt && (
                       <span className={`text-[10px] ${rttClass}`}>
                         {rtt.ok ? `${rtt.rttMs}ms` : "drop"}
                       </span>
                     )}
-                    {missingToken && (
+                    {missingToken && !evicted && (
                       <span className="text-[var(--color-danger)] text-[10px] uppercase tracking-wider">
                         no token
                       </span>
@@ -696,6 +838,22 @@ export function Synapse() {
                   </span>
                 );
               })}
+            </div>
+          )}
+
+          {/* Phase 4 chunk Q: cluster layout. Stacked-bar visualization of
+              which device got how much model. Only renders after a model
+              load completes (we get the snapshot from llama-server's
+              "load_tensors: <DEVICE> model buffer size = …" lines). */}
+          {clusterLayout && clusterLayout.devices.length > 0 && (
+            <div className="mt-4">
+              <div className="flex items-center justify-between text-xs text-[var(--color-text-muted)] mb-1.5">
+                <span>Layer distribution (last load)</span>
+                <span className="text-[var(--color-text-subtle)]">
+                  {(clusterLayout.devices.reduce((a, b) => a + b.mb, 0) / 1024).toFixed(1)} GB total
+                </span>
+              </div>
+              <ClusterLayoutBar layout={clusterLayout} />
             </div>
           )}
 
@@ -745,17 +903,29 @@ export function Synapse() {
                       ({anyExplicit ? "custom" : "auto"})
                     </span>
                   </span>
-                  {anyExplicit && (
+                  <span className="flex items-center gap-3">
                     <button
                       onClick={(e) => {
                         e.preventDefault();
-                        clearAllWeights();
+                        suggestSplitFromVram();
                       }}
-                      className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)] hover:text-[var(--color-text)]"
+                      className="text-[10px] uppercase tracking-wider text-[var(--color-accent)] hover:text-[var(--color-text)]"
+                      title="Pre-fill weights from each device's VRAM"
                     >
-                      reset
+                      suggest
                     </button>
-                  )}
+                    {anyExplicit && (
+                      <button
+                        onClick={(e) => {
+                          e.preventDefault();
+                          clearAllWeights();
+                        }}
+                        className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)] hover:text-[var(--color-text)]"
+                      >
+                        reset
+                      </button>
+                    )}
+                  </span>
                 </summary>
                 <div className="mt-2 flex flex-col gap-2">
                   <SplitSlider
@@ -944,6 +1114,50 @@ function SplitSlider({
   );
 }
 
+/// Phase 4 chunk Q: stacked-bar visualization of model-layer distribution
+/// across host + RPC workers. We bucket by exact device label so a layout
+/// like `CUDA0 + RPC[127.0.0.1:54712] + CPU` shows three segments. Colour
+/// rotates through a small palette — the goal is "you can see the relative
+/// sizes" not "every device has its own brand colour."
+function ClusterLayoutBar({ layout }: { layout: SynapseClusterLayout }) {
+  const total = layout.devices.reduce((a, b) => a + b.mb, 0);
+  if (total === 0) return null;
+  // Tailwind-friendly palette. Order matches eye order in a typical
+  // pipeline split — host first, then workers.
+  const palette = [
+    "bg-[var(--color-accent)]",
+    "bg-[var(--color-success)]",
+    "bg-yellow-400",
+    "bg-purple-400",
+    "bg-pink-400",
+  ];
+  return (
+    <div>
+      <div className="flex h-3 rounded overflow-hidden border border-[var(--color-border)]">
+        {layout.devices.map((d, i) => (
+          <div
+            key={`${d.device}-${i}`}
+            title={`${d.device}: ${(d.mb / 1024).toFixed(2)} GB`}
+            className={palette[i % palette.length]}
+            style={{ width: `${(d.mb / total) * 100}%` }}
+          />
+        ))}
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] font-mono text-[var(--color-text-muted)]">
+        {layout.devices.map((d, i) => (
+          <span key={`${d.device}-${i}-legend`} className="flex items-center gap-1">
+            <span
+              aria-hidden
+              className={`inline-block w-2 h-2 rounded-sm ${palette[i % palette.length]}`}
+            />
+            {d.device} · {(d.mb / 1024).toFixed(2)} GB ({Math.round((d.mb / total) * 100)}%)
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /// Tiny inline SVG sparkline. Avoids a charting dep — we only need a
 /// 30-point line for the tok/s feed. Auto-scales y to the visible range.
 function Sparkline({
@@ -992,5 +1206,146 @@ function Sparkline({
         className="text-[var(--color-accent)]"
       />
     </svg>
+  );
+}
+
+/// Phase 4 chunk P: read-only Synapse viewer for the phone PWA. Polls the
+/// desktop's `/api/synapse/*` endpoints every 5 s — no event subscription
+/// because the LAN server doesn't currently expose SSE/WebSocket for
+/// these and 5 s is plenty for the diagnostic use case.
+function RemoteSynapseView() {
+  const [workerStatus, setWorkerStatus] = useState<{
+    running: boolean;
+    port: number;
+    pid: number | null;
+  } | null>(null);
+  const [peers, setPeers] = useState<SynapsePeer[]>([]);
+  const [sessions, setSessions] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let stopped = false;
+    async function refresh() {
+      try {
+        const [s, p, sess] = await Promise.all([
+          remoteSynapse.status(),
+          remoteSynapse.peers(),
+          remoteSynapse.sessions(),
+        ]);
+        if (stopped) return;
+        setWorkerStatus(s);
+        setPeers(p);
+        setSessions(sess.count);
+        setError(null);
+      } catch (e: unknown) {
+        if (stopped) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg);
+      }
+    }
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <div className="flex flex-col h-full">
+      <header className="px-5 py-4 border-b border-[var(--color-border-soft)]">
+        <h1 className="font-semibold text-[17px] flex items-center gap-2">
+          <Network size={16} /> Synapse
+          <span className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)] bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-full px-2 py-0.5">
+            view-only
+          </span>
+        </h1>
+        <p className="text-[var(--color-text-muted)] text-sm">
+          Live status of the paired desktop's worker and discovered peers.
+          Editing happens on the desktop.
+        </p>
+      </header>
+
+      <div className="flex-1 overflow-y-auto px-5 py-5 max-w-3xl">
+        {error && (
+          <div className="mb-4 text-xs text-[var(--color-danger)] rounded-md border border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 px-3 py-2">
+            Couldn't reach desktop: {error}
+          </div>
+        )}
+
+        <div className="mb-6 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Server size={15} className="text-[var(--color-text-muted)]" />
+            <h2 className="font-semibold text-sm">Worker on desktop</h2>
+          </div>
+          {workerStatus ? (
+            <div className="grid grid-cols-2 gap-y-2 text-sm">
+              <div className="text-[var(--color-text-muted)]">Status</div>
+              <div className="text-right">
+                {workerStatus.running ? (
+                  <span className="text-[var(--color-success)]">running on :{workerStatus.port}</span>
+                ) : (
+                  <span className="text-[var(--color-text-subtle)]">idle</span>
+                )}
+              </div>
+              <div className="text-[var(--color-text-muted)]">PID</div>
+              <div className="text-right font-mono">{workerStatus.pid ?? "—"}</div>
+              <div className="text-[var(--color-text-muted)]">Active hosts</div>
+              <div className="text-right">{sessions}</div>
+            </div>
+          ) : (
+            <p className="text-sm text-[var(--color-text-muted)]">Loading…</p>
+          )}
+        </div>
+
+        <div className="mb-6 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Radio size={15} className="text-[var(--color-text-muted)]" />
+            <h2 className="font-semibold text-sm">Discovered on LAN ({peers.length})</h2>
+          </div>
+          {peers.length === 0 ? (
+            <p className="text-sm text-[var(--color-text-subtle)]">No peers visible from the desktop.</p>
+          ) : (
+            <ul className="flex flex-col gap-1.5">
+              {peers.map((p) => (
+                <li
+                  key={p.id}
+                  className="flex items-center gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2"
+                >
+                  <div className="w-1.5 h-1.5 rounded-full bg-[var(--color-success)]" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium truncate flex items-center gap-1.5">
+                      {p.hostname}
+                      {p.verified ? (
+                        <span title="HMAC verified" className="text-[var(--color-success)]">
+                          <Check size={12} />
+                        </span>
+                      ) : (
+                        <span className="text-[10px] uppercase tracking-wider text-[var(--color-text-subtle)]">
+                          unverified
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-[var(--color-text-muted)] font-mono truncate">
+                      {p.endpoint}
+                    </div>
+                    {(p.acceleratorName || p.vramGb) && (
+                      <div className="text-[11px] text-[var(--color-text-subtle)] truncate">
+                        {p.acceleratorName ?? "unknown"}
+                        {p.vramGb ? ` · ${p.vramGb.toFixed(1)} GB` : ""}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <p className="text-[11px] text-[var(--color-text-subtle)] text-center">
+          Refreshes every 5 s · open the desktop app to manage peers
+        </p>
+      </div>
+    </div>
   );
 }

@@ -71,7 +71,7 @@ function App() {
         {!remote && view === "models" && <Models />}
         {!remote && view === "knowledge" && <Knowledge />}
         {!remote && view === "image" && <ImageGen />}
-        {!remote && view === "synapse" && <Synapse />}
+        {view === "synapse" && <Synapse />}
         {view === "settings" && <Settings />}
       </main>
     </div>

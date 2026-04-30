@@ -10,6 +10,7 @@ mod sd;
 mod server;
 mod synapse;
 mod synapse_proto;
+mod synapse_tls;
 mod synapse_token;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
@@ -300,6 +301,14 @@ async fn set_known_synapse_tokens(
     Ok(())
 }
 
+#[tauri::command]
+fn synapse_active_sessions() -> u32 {
+    // Phase 4 chunk O: read the global counter for the worker UI's
+    // "X hosts connected" badge. The Rust process is single-tenant so
+    // a global atomic is the right shape here.
+    auth_proxy::ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn generate_pin() -> String {
     let raw = uuid::Uuid::new_v4().as_u128();
     format!("{:06}", (raw % 1_000_000) as u32)
@@ -336,12 +345,25 @@ pub fn run() {
             let llama2 = llama.clone();
             let pin2 = pin.clone();
             let tokens2 = tokens.clone();
+            // Phase 4 chunk P: clone the SynapseState so the LAN server
+            // can serve read-only views to the phone PWA. The discovery
+            // task below reuses the same Arc.
+            let synapse_for_server = synapse.clone();
             let synapse2 = synapse.clone();
             let handle_for_discovery = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let resource_dir = handle.path().resource_dir().ok();
                 let static_dir = resource_dir.map(|d| d.join("dist")).filter(|p| p.exists());
-                match server::start_lan_server(llama2, static_dir, 3939, pin2, tokens2).await {
+                match server::start_lan_server(
+                    llama2,
+                    static_dir,
+                    3939,
+                    pin2,
+                    tokens2,
+                    synapse_for_server,
+                )
+                .await
+                {
                     Ok(url) => {
                         holder2.lan_url.set(url.clone());
                         let _ = handle.emit("lan:ready", url);
@@ -390,6 +412,7 @@ pub fn run() {
             get_synapse_token,
             rotate_synapse_token,
             set_known_synapse_tokens,
+            synapse_active_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

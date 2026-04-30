@@ -60,3 +60,14 @@ pub fn sd_output_dir() -> PathBuf {
 pub fn synapse_token_path() -> PathBuf {
     data_dir().join("synapse-token.txt")
 }
+
+/// Phase 4 chunk N: paths to the worker's persisted self-signed TLS cert
+/// (PEM) and matching private key. Generated alongside the token on first
+/// worker start. Together with the token they form the worker's identity.
+pub fn synapse_cert_path() -> PathBuf {
+    data_dir().join("synapse-cert.pem")
+}
+
+pub fn synapse_key_path() -> PathBuf {
+    data_dir().join("synapse-key.pem")
+}

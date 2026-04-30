@@ -1,4 +1,5 @@
 use crate::llama::LlamaState;
+use crate::synapse::SynapseState;
 use anyhow::Result;
 use axum::{
     body::Body,
@@ -22,6 +23,9 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub pin: String,
     pub tokens: Arc<Mutex<HashSet<String>>>,
+    /// Phase 4 chunk P: SynapseState handle so the LAN server can serve a
+    /// read-only view of the worker + discovered peers to paired phones.
+    pub synapse: Arc<SynapseState>,
 }
 
 #[derive(Deserialize)]
@@ -40,18 +44,33 @@ pub async fn start_lan_server(
     port: u16,
     pin: String,
     tokens: Arc<Mutex<HashSet<String>>>,
+    synapse: Arc<SynapseState>,
 ) -> Result<String> {
     let state = AppState {
         llama,
         http: reqwest::Client::new(),
         pin,
         tokens,
+        synapse,
     };
 
     let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
         .route("/api/status", get(status))
+        // Phase 4 chunk P: read-only Synapse views for paired phones/iPads.
+        // The phone can't actually drive the worker (start/stop, edit
+        // tokens, change splits) — those stay desktop-only — but it can
+        // observe everything the desktop sees.
+        .route("/api/synapse/status", get(synapse_status))
+        .route("/api/synapse/peers", get(synapse_peers))
+        .route("/api/synapse/sessions", get(synapse_sessions))
+        // Phase 4 chunk R: Prometheus-format metrics. Plain text scrape
+        // target at /metrics, no client lib dep — the format is small
+        // enough to hand-roll. Auth still applies via the same Bearer
+        // gate as the rest of /api, so a paired Prometheus server reaches
+        // it but a drive-by scrape doesn't.
+        .route("/api/metrics", get(prometheus_metrics))
         .route("/v1/*rest", any(proxy_v1))
         .route("/health", get(proxy_health))
         // Vite's HMR client polls this when its WebSocket drops; on a 200 it
@@ -237,4 +256,122 @@ async fn forward(client: &reqwest::Client, url: &str, req: Request<Body>) -> Res
         h.extend(rheaders);
     }
     resp.body(body).unwrap()
+}
+
+// Phase 4 chunk P: Synapse read-only views for the phone PWA.
+//
+// `/api/synapse/status`  — is the worker running, on what port, what's its PID
+// `/api/synapse/peers`   — current discovered-on-LAN peer list
+// `/api/synapse/sessions` — live count of authenticated host connections
+//
+// The phone consumes these to render its read-only Synapse tab. We don't
+// expose start/stop/restart from the LAN — the phone is for monitoring,
+// not control, and gating mutations behind the desktop UI keeps the
+// surface area small.
+async fn synapse_status(State(s): State<AppState>) -> impl IntoResponse {
+    Json(s.synapse.status().await)
+}
+
+async fn synapse_peers(State(s): State<AppState>) -> impl IntoResponse {
+    Json(s.synapse.list_peers().await)
+}
+
+async fn synapse_sessions(State(_): State<AppState>) -> impl IntoResponse {
+    let count = crate::auth_proxy::ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Relaxed);
+    Json(serde_json::json!({ "count": count }))
+}
+
+/// Phase 4 chunk R: Prometheus exposition format. Plain text, one metric
+/// per line per series, with HELP/TYPE preambles. The contract is small
+/// and stable: rename a metric here = breaking change for anyone
+/// scraping it, so we treat field names as part of the public API.
+async fn prometheus_metrics(State(s): State<AppState>) -> impl IntoResponse {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    // Worker mode + active sessions.
+    let synapse_status = s.synapse.status().await;
+    let _ = writeln!(
+        out,
+        "# HELP localmind_synapse_worker_running 1 if the Synapse worker is currently spawned, 0 otherwise."
+    );
+    let _ = writeln!(out, "# TYPE localmind_synapse_worker_running gauge");
+    let _ = writeln!(
+        out,
+        "localmind_synapse_worker_running {}",
+        if synapse_status.running { 1 } else { 0 }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP localmind_synapse_worker_port TCP port of the worker's auth proxy (0 when not running)."
+    );
+    let _ = writeln!(out, "# TYPE localmind_synapse_worker_port gauge");
+    let _ = writeln!(
+        out,
+        "localmind_synapse_worker_port {}",
+        if synapse_status.running {
+            synapse_status.port
+        } else {
+            0
+        }
+    );
+
+    let active = crate::auth_proxy::ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = writeln!(
+        out,
+        "# HELP localmind_synapse_active_sessions Authenticated host connections currently held by the auth proxy."
+    );
+    let _ = writeln!(out, "# TYPE localmind_synapse_active_sessions gauge");
+    let _ = writeln!(out, "localmind_synapse_active_sessions {active}");
+
+    // Discovered peers, with a label per verification state. Useful to
+    // alert on "discovered: yes, verified: no" — that's "your beacon
+    // signing or token-pasting workflow has drifted."
+    let peers = s.synapse.list_peers().await;
+    let verified_count = peers.iter().filter(|p| p.verified).count();
+    let unverified_count = peers.len() - verified_count;
+    let _ = writeln!(
+        out,
+        "# HELP localmind_synapse_peers Discovered peers on the LAN, broken down by verification state."
+    );
+    let _ = writeln!(out, "# TYPE localmind_synapse_peers gauge");
+    let _ = writeln!(
+        out,
+        "localmind_synapse_peers{{verified=\"true\"}} {verified_count}"
+    );
+    let _ = writeln!(
+        out,
+        "localmind_synapse_peers{{verified=\"false\"}} {unverified_count}"
+    );
+
+    // llama-server status, for quick "is anything loaded" checks.
+    let llama_status = s.llama.status().await;
+    let _ = writeln!(
+        out,
+        "# HELP localmind_llama_chat_running 1 if a chat model is currently loaded, 0 otherwise."
+    );
+    let _ = writeln!(out, "# TYPE localmind_llama_chat_running gauge");
+    let _ = writeln!(
+        out,
+        "localmind_llama_chat_running {}",
+        if llama_status.running { 1 } else { 0 }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP localmind_llama_embed_running 1 if an embedding model is currently loaded, 0 otherwise."
+    );
+    let _ = writeln!(out, "# TYPE localmind_llama_embed_running gauge");
+    let _ = writeln!(
+        out,
+        "localmind_llama_embed_running {}",
+        if llama_status.embedding_running { 1 } else { 0 }
+    );
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        out,
+    )
 }

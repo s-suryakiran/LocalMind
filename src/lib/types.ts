@@ -69,6 +69,10 @@ export interface SynapseWorker {
    *  weight set, the host passes `--tensor-split` so layers split by ratio
    *  instead of evenly. Undefined keeps llama.cpp's default heuristic. */
   weight?: number;
+  /** Phase 4 chunk N: SHA-256 hex fingerprint pinned for TLS verification.
+   *  Captured from the worker's HMAC-verified beacon at pair time;
+   *  undefined means TOFU (any cert accepted, token still gates). */
+  certFingerprint?: string;
 }
 
 export interface LlamaSettings {
@@ -105,6 +109,15 @@ export interface SynapsePeer {
    *  Hosts who haven't paired yet always see false; pair via the dialog and
    *  the next set_known_synapse_tokens call flips this on the cached entry. */
   verified: boolean;
+  /** Phase 4 chunk J: hardware advertised in the beacon. Pre-Phase-4
+   *  workers leave these undefined; treat that as "unknown, fall back to
+   *  conservative defaults". */
+  vramGb?: number;
+  acceleratorKind?: "apple" | "nvidia" | "amd" | "intel-arc" | "cpu";
+  acceleratorName?: string;
+  /** Phase 4 chunk N: SHA-256 hex fingerprint of the worker's TLS cert.
+   *  Rides inside the HMAC-signed beacon body. UI captures it on pair. */
+  certFingerprint?: string;
 }
 
 /** synapse:metrics event payload — emitted by the chat llama-server's stderr
@@ -121,6 +134,14 @@ export interface SynapseRtt {
   endpoint: string;
   rttMs: number;
   ok: boolean;
+  ts: number;
+}
+
+/** synapse:cluster-layout event payload — emitted once per model load,
+ *  containing one entry per device that received layer tensors. Built
+ *  from `load_tensors: <DEVICE> model buffer size = X MiB` lines. */
+export interface SynapseClusterLayout {
+  devices: { device: string; mb: number }[];
   ts: number;
 }
 

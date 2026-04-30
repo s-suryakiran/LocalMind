@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { api, listen } from "../lib/api";
 import { useApp } from "../lib/store";
-import type { HardwareInfo, ModelDownloadProgress, ModelListing } from "../lib/types";
+import type { HardwareInfo, ModelDownloadProgress, ModelListing, SynapsePeer } from "../lib/types";
 import { formatBytes, formatCompact } from "../lib/util";
 
 const SUGGESTED = [
@@ -23,16 +23,57 @@ const SUGGESTED = [
   { label: "Vision (LLaVA)", q: "llava-1.6 GGUF" },
 ];
 
+/** Phase 4 chunk M: reverse-search filter modes.
+ *  - "all": no filter (default)
+ *  - "fits-host": only show files loadable on the host alone
+ *  - "fits-cluster": only show files loadable across host + Synapse
+ *  - "needs-synapse": only show files that *require* Synapse to load
+ *      (won't fit on host alone but fit cluster). The most useful mode
+ *      when you've just paired a worker and want to know what it
+ *      newly unlocked.
+ */
+type FitFilter = "all" | "fits-host" | "fits-cluster" | "needs-synapse";
+
 export function Marketplace() {
   const [query, setQuery] = useState("llama-3.1-8b-instruct GGUF");
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<ModelListing[]>([]);
+  const [fitFilter, setFitFilter] = useState<FitFilter>("all");
   const { installed, setInstalled, downloads, setDownload, clearDownload, hardware, synapse } = useApp();
-  // peerCount = workers the user has added with a token (i.e. usable). We
-  // don't include unverified beacon peers in the Synapse budget — those
-  // can't actually receive layers until the user pairs.
-  const peerCount = synapse.workers.filter((w) => !!w.token).length;
-  const budget = useMemo(() => memoryBudgetGb(hardware, peerCount), [hardware, peerCount]);
+  // Phase 4 chunk J: pull real per-peer VRAM from the discovered-peers
+  // cache so the marketplace budget reflects what's actually on the LAN
+  // instead of the conservative 4-GB-per-peer fallback. We resolve token-
+  // paired workers (the ones the user can actually use) by endpoint
+  // against the live peer list.
+  const [peers, setPeers] = useState<Record<string, SynapsePeer>>({});
+  useEffect(() => {
+    api.synapseListPeers()
+      .then((list) => {
+        const next: Record<string, SynapsePeer> = {};
+        for (const p of list) next[p.endpoint] = p;
+        setPeers(next);
+      })
+      .catch(() => {});
+    let cancelled = false;
+    const subs: Array<() => void> = [];
+    listen<SynapsePeer>("synapse:peer-added", (p) => {
+      setPeers((prev) => ({ ...prev, [p.endpoint]: p }));
+    }).then((un) => { if (cancelled) un(); else subs.push(un); });
+    return () => {
+      cancelled = true;
+      subs.forEach((un) => un());
+    };
+  }, []);
+  // peerVrams: per-paired-worker VRAM in GB. Falls back to 4 (the chunk-H
+  // conservative default) when the worker hasn't broadcast hardware info
+  // yet — typically pre-Phase-4 builds.
+  const peerVrams = synapse.workers
+    .filter((w) => !!w.token)
+    .map((w) => peers[w.endpoint]?.vramGb ?? 4);
+  const budget = useMemo(
+    () => memoryBudgetGb(hardware, peerVrams),
+    [hardware, peerVrams.join(",")],  // primitive-array dep avoids object-identity churn
+  );
 
   useEffect(() => {
     listen<ModelDownloadProgress>("model:progress", (p) => {
@@ -91,6 +132,37 @@ export function Marketplace() {
             </button>
           ))}
         </div>
+
+        {/* Phase 4 chunk M: fit filters. Only show the cluster-aware
+            buckets when the user has a Synapse cluster — otherwise
+            "fits cluster" and "fits host" are identical and confusing. */}
+        <div className="flex flex-wrap gap-2 mt-2 items-center">
+          <span className="text-[11px] uppercase tracking-wider text-[var(--color-text-subtle)]">Filter</span>
+          {(
+            [
+              { v: "all" as const, label: "All" },
+              { v: "fits-host" as const, label: "Fits this machine" },
+              ...(peerVrams.length > 0
+                ? [
+                    { v: "fits-cluster" as const, label: "Fits cluster" },
+                    { v: "needs-synapse" as const, label: "Unlocked by Synapse" },
+                  ]
+                : []),
+            ]
+          ).map((b) => (
+            <button
+              key={b.v}
+              onClick={() => setFitFilter(b.v)}
+              className={`text-xs px-2.5 py-1 rounded-full border ${
+                fitFilter === b.v
+                  ? "border-[var(--color-accent)] text-[var(--color-text)]"
+                  : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:border-[var(--color-accent)]/60"
+              }`}
+            >
+              {b.label}
+            </button>
+          ))}
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto px-5 py-4">
@@ -100,14 +172,14 @@ export function Marketplace() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {results.map((m) => (
+            {applyFitFilter(results, fitFilter, budget).map((m) => (
               <ModelCard
                 key={m.id}
                 listing={m}
                 installed={installed}
                 downloads={downloads}
                 budget={budget}
-                peerCount={peerCount}
+                peerCount={peerVrams.length}
               />
             ))}
           </div>
@@ -257,18 +329,15 @@ function ModelCard({
   );
 }
 
-/** Phase 3 chunk H: compute the available memory budget for loading a model.
- *  Returns { hostGb, synapseGb } so the marketplace can show the user how
- *  Synapse extends their reach. We deliberately don't try to be exact about
- *  KV-cache or activations — the budget is a guidance, not a guarantee, and
- *  keeping the heuristic simple beats getting it precisely wrong.
+/** Phase 3 chunk H + Phase 4 chunk J: compute the available memory budget
+ *  for loading a model. Returns { hostGb, synapseGb } so the marketplace
+ *  can show the user how Synapse extends their reach.
  *
- *  Host budget = total RAM (Apple Silicon: unified memory) or VRAM (NVIDIA/AMD).
- *  Synapse budget = host + sum of detected peers, with 4 GB assumed per peer
- *  since beacon doesn't carry VRAM yet (chunk 2c, deferred). Conservative: a
- *  paired RTX 5070 Ti has 16 GB but we assume 4, so the badge under-promises.
- */
-function memoryBudgetGb(hw: HardwareInfo | null, peerCount: number) {
+ *  Host budget = total RAM × 0.75 (Apple Silicon: unified memory) or VRAM
+ *  (NVIDIA/AMD).
+ *  Synapse budget = host + sum of advertised peer VRAM. Pre-Phase-4 peers
+ *  pass 4 GB as a fallback so they still contribute conservatively. */
+function memoryBudgetGb(hw: HardwareInfo | null, peerVrams: number[]) {
   if (!hw) return { hostGb: 0, synapseGb: 0 };
   const acc = hw.accelerator;
   const hostGb = (() => {
@@ -288,8 +357,8 @@ function memoryBudgetGb(hw: HardwareInfo | null, peerCount: number) {
         return Math.max(0, Math.floor(hw.totalMemoryGb - 4));
     }
   })();
-  const synapseGb = hostGb + peerCount * 4;
-  return { hostGb, synapseGb };
+  const peerSum = peerVrams.reduce((a, b) => a + b, 0);
+  return { hostGb, synapseGb: hostGb + peerSum };
 }
 
 /** Estimated bytes-on-GPU needed to actually load a GGUF. The file size is
@@ -297,6 +366,52 @@ function memoryBudgetGb(hw: HardwareInfo | null, peerCount: number) {
  *  by 1.15 to keep the badge from being aggressively optimistic. */
 function fitGb(fileBytes: number) {
   return (fileBytes * 1.15) / 1024 ** 3;
+}
+
+/** Phase 4 chunk M: apply the fit filter and sort the surviving listings.
+ *  A model survives if at least one of its files matches the filter (since
+ *  multi-quant repos commonly have a small variant that fits + a big one
+ *  that doesn't). We sort biggest-fitting-file-first per listing so the
+ *  user sees impressive models at the top of "fits cluster" rather than
+ *  having to scroll through trivially-small ones first. */
+function applyFitFilter(
+  listings: ModelListing[],
+  filter: FitFilter,
+  budget: { hostGb: number; synapseGb: number },
+): ModelListing[] {
+  if (filter === "all") return listings;
+  const matchesFile = (bytes: number) => {
+    const need = fitGb(bytes);
+    switch (filter) {
+      case "fits-host":
+        return budget.hostGb > 0 && need <= budget.hostGb;
+      case "fits-cluster":
+        return budget.synapseGb > 0 && need <= budget.synapseGb;
+      case "needs-synapse":
+        return (
+          budget.hostGb > 0 &&
+          need > budget.hostGb &&
+          budget.synapseGb > 0 &&
+          need <= budget.synapseGb
+        );
+      default:
+        return true;
+    }
+  };
+  const surviving = listings.filter((l) =>
+    l.files.some((f) => matchesFile(f.sizeBytes)),
+  );
+  // Sort by largest matching file: it's a stand-in for "most ambitious
+  // model that fits" and matches the mental model of someone exploring
+  // their cluster's headroom.
+  return [...surviving].sort((a, b) => {
+    const maxFit = (l: ModelListing) =>
+      Math.max(
+        ...l.files.filter((f) => matchesFile(f.sizeBytes)).map((f) => f.sizeBytes),
+        0,
+      );
+    return maxFit(b) - maxFit(a);
+  });
 }
 
 function pickDefault(l: ModelListing) {
