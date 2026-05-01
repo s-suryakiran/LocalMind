@@ -1,12 +1,16 @@
+mod auth_proxy;
 mod binaries;
 mod config;
 mod hardware;
+mod host_proxy;
 mod llama;
 mod models;
 mod rag;
 mod sd;
 mod server;
 mod synapse;
+mod synapse_proto;
+mod synapse_token;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
 use models::{InstalledModel, ModelKind, ModelListing};
@@ -268,6 +272,34 @@ async fn synapse_list_peers(
     Ok(state.synapse.list_peers().await)
 }
 
+#[tauri::command]
+fn get_synapse_token() -> Result<String, String> {
+    // Available even when the worker isn't running so the UI can show the
+    // token immediately on page load. load_or_create generates+persists on
+    // first call, then idempotent thereafter.
+    synapse_token::load_or_create().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rotate_synapse_token() -> Result<String, String> {
+    // Returns the freshly-generated token. Callers should warn the user
+    // first — every paired host has to re-paste this value or their
+    // model loads will fail at the auth probe.
+    synapse_token::rotate().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_known_synapse_tokens(
+    state: State<'_, Arc<AppStateHolder>>,
+    tokens: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    // Frontend pushes its known tokens (endpoint → token) on Synapse mount
+    // and on every edit. Used to verify incoming beacon HMACs and re-verify
+    // cached peers immediately when a host adds a token.
+    state.synapse.set_known_tokens(tokens).await;
+    Ok(())
+}
+
 fn generate_pin() -> String {
     let raw = uuid::Uuid::new_v4().as_u128();
     format!("{:06}", (raw % 1_000_000) as u32)
@@ -355,6 +387,9 @@ pub fn run() {
             synapse_worker_status,
             restart_synapse_worker,
             synapse_list_peers,
+            get_synapse_token,
+            rotate_synapse_token,
+            set_known_synapse_tokens,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

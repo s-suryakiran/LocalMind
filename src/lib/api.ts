@@ -114,6 +114,10 @@ export const api = {
   restartSynapseWorker: (port?: number) =>
     invoke<SynapseWorkerStatus>("restart_synapse_worker", { port }),
   synapseListPeers: () => invoke<SynapsePeer[]>("synapse_list_peers"),
+  getSynapseToken: () => invoke<string>("get_synapse_token"),
+  rotateSynapseToken: () => invoke<string>("rotate_synapse_token"),
+  setKnownSynapseTokens: (tokens: Record<string, string>) =>
+    invoke<void>("set_known_synapse_tokens", { tokens }),
 };
 
 export type ChatContentPart =

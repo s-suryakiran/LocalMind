@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, Download, Check, Loader2, HardDrive, Heart, ExternalLink } from "lucide-react";
+import {
+  Search,
+  Download,
+  Check,
+  Loader2,
+  HardDrive,
+  Heart,
+  ExternalLink,
+  Network,
+  TriangleAlert,
+} from "lucide-react";
 import { api, listen } from "../lib/api";
 import { useApp } from "../lib/store";
-import type { ModelDownloadProgress, ModelListing } from "../lib/types";
+import type { HardwareInfo, ModelDownloadProgress, ModelListing } from "../lib/types";
 import { formatBytes, formatCompact } from "../lib/util";
 
 const SUGGESTED = [
@@ -17,7 +27,12 @@ export function Marketplace() {
   const [query, setQuery] = useState("llama-3.1-8b-instruct GGUF");
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<ModelListing[]>([]);
-  const { installed, setInstalled, downloads, setDownload, clearDownload } = useApp();
+  const { installed, setInstalled, downloads, setDownload, clearDownload, hardware, synapse } = useApp();
+  // peerCount = workers the user has added with a token (i.e. usable). We
+  // don't include unverified beacon peers in the Synapse budget — those
+  // can't actually receive layers until the user pairs.
+  const peerCount = synapse.workers.filter((w) => !!w.token).length;
+  const budget = useMemo(() => memoryBudgetGb(hardware, peerCount), [hardware, peerCount]);
 
   useEffect(() => {
     listen<ModelDownloadProgress>("model:progress", (p) => {
@@ -91,6 +106,8 @@ export function Marketplace() {
                 listing={m}
                 installed={installed}
                 downloads={downloads}
+                budget={budget}
+                peerCount={peerCount}
               />
             ))}
           </div>
@@ -101,11 +118,17 @@ export function Marketplace() {
 }
 
 function ModelCard({
-  listing, installed, downloads,
+  listing,
+  installed,
+  downloads,
+  budget,
+  peerCount,
 }: {
   listing: ModelListing;
   installed: { filename: string }[];
   downloads: Record<string, { percent: number; stage: string; downloaded: number; total: number }>;
+  budget: { hostGb: number; synapseGb: number };
+  peerCount: number;
 }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -158,11 +181,47 @@ function ModelCard({
         {(expanded ? filesSorted : defaultFile ? [defaultFile] : filesSorted.slice(0, 1)).map((f) => {
           const progress = downloads[safeId(listing.id, f.filename)];
           const installedFlag = isInstalled(f);
+          // Phase 3 chunk H fit calculation. Three buckets the user cares
+          // about: comfortably fits on host, needs Synapse, doesn't fit even
+          // with current Synapse cluster. We render the third as a hard
+          // warning so users don't waste a download on a non-loadable model.
+          const needGb = fitGb(f.sizeBytes);
+          const fitsHost = budget.hostGb > 0 && needGb <= budget.hostGb;
+          const fitsSynapse = budget.synapseGb > 0 && needGb <= budget.synapseGb;
+          let badge: React.ReactNode = null;
+          if (!fitsHost && fitsSynapse) {
+            badge = (
+              <span
+                title={
+                  peerCount > 0
+                    ? `Needs ~${needGb.toFixed(1)} GB · host has ~${budget.hostGb} GB · Synapse extends to ~${budget.synapseGb} GB`
+                    : `Needs ~${needGb.toFixed(1)} GB · host has ~${budget.hostGb} GB · pair a Synapse worker to load this`
+                }
+                className="text-[10px] uppercase tracking-wider text-[var(--color-accent)] flex items-center gap-1"
+              >
+                <Network size={10} /> needs synapse
+              </span>
+            );
+          } else if (!fitsHost && !fitsSynapse && budget.hostGb > 0) {
+            badge = (
+              <span
+                title={`Needs ~${needGb.toFixed(1)} GB · best you have (host + ${peerCount} peer${peerCount === 1 ? "" : "s"}) is ~${budget.synapseGb} GB`}
+                className="text-[10px] uppercase tracking-wider text-[var(--color-danger)] flex items-center gap-1"
+              >
+                <TriangleAlert size={10} /> too large
+              </span>
+            );
+          }
           return (
             <div key={f.filename} className="flex items-center justify-between gap-2 text-xs">
               <div className="min-w-0">
                 <div className="truncate">{f.filename}</div>
-                <div className="text-[var(--color-text-subtle)]">{f.quantization} · {formatBytes(f.sizeBytes)}</div>
+                <div className="text-[var(--color-text-subtle)] flex items-center gap-2">
+                  <span>
+                    {f.quantization} · {formatBytes(f.sizeBytes)}
+                  </span>
+                  {badge}
+                </div>
               </div>
               {installedFlag ? (
                 <span className="text-[var(--color-success)] flex items-center gap-1"><Check size={12} /> installed</span>
@@ -196,6 +255,48 @@ function ModelCard({
       )}
     </div>
   );
+}
+
+/** Phase 3 chunk H: compute the available memory budget for loading a model.
+ *  Returns { hostGb, synapseGb } so the marketplace can show the user how
+ *  Synapse extends their reach. We deliberately don't try to be exact about
+ *  KV-cache or activations — the budget is a guidance, not a guarantee, and
+ *  keeping the heuristic simple beats getting it precisely wrong.
+ *
+ *  Host budget = total RAM (Apple Silicon: unified memory) or VRAM (NVIDIA/AMD).
+ *  Synapse budget = host + sum of detected peers, with 4 GB assumed per peer
+ *  since beacon doesn't carry VRAM yet (chunk 2c, deferred). Conservative: a
+ *  paired RTX 5070 Ti has 16 GB but we assume 4, so the badge under-promises.
+ */
+function memoryBudgetGb(hw: HardwareInfo | null, peerCount: number) {
+  if (!hw) return { hostGb: 0, synapseGb: 0 };
+  const acc = hw.accelerator;
+  const hostGb = (() => {
+    switch (acc.type) {
+      case "appleSilicon":
+        // Apple Silicon shares unified memory; usable budget is ~75% of
+        // total before the OS pushes back hard.
+        return Math.floor(acc.unifiedMemoryGb * 0.75);
+      case "nvidia":
+        return acc.vramGb;
+      case "amd":
+        return acc.vramGb;
+      case "intelArc":
+      case "cpu":
+      default:
+        // No GPU info — fall back to system RAM minus a 4 GB OS reserve.
+        return Math.max(0, Math.floor(hw.totalMemoryGb - 4));
+    }
+  })();
+  const synapseGb = hostGb + peerCount * 4;
+  return { hostGb, synapseGb };
+}
+
+/** Estimated bytes-on-GPU needed to actually load a GGUF. The file size is
+ *  the dominant term; KV cache adds 5–15% depending on context. We multiply
+ *  by 1.15 to keep the badge from being aggressively optimistic. */
+function fitGb(fileBytes: number) {
+  return (fileBytes * 1.15) / 1024 ** 3;
 }
 
 function pickDefault(l: ModelListing) {

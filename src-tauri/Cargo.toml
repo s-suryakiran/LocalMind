@@ -44,6 +44,15 @@ local-ip-address = "0.6"
 zip = "2"
 mdns-sd = "0.11"
 hostname = "0.4"
+# Phase 3: Synapse auth proxy (token + HMAC-signed beacon).
+# `data-encoding` for human-readable base32 tokens (printable, no padding
+# issues on copy-paste), `hmac` + `sha2` for the beacon signature, and
+# `rand` for cryptographic-strength token generation.
+data-encoding = "2"
+hmac = "0.12"
+sha2 = "0.10"
+rand = { version = "0.8", features = ["std_rng"] }
+subtle = "2"
 
 [profile.release]
 lto = true

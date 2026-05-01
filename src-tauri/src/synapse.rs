@@ -6,7 +6,7 @@
 //   - expose a `restart_worker` so the host can flush worker VRAM on demand
 //
 // Auth + smart layer split + tok/s telemetry come in Phase 3.
-use crate::{binaries, config};
+use crate::{auth_proxy, binaries, config, synapse_token};
 use anyhow::{anyhow, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,14 @@ use tokio::task::JoinHandle;
 pub const DEFAULT_WORKER_PORT: u16 = 50052;
 const SERVICE_TYPE: &str = "_localmind-synapse._tcp.local.";
 
+/// Internal port that rpc-server binds to on localhost. Public traffic hits
+/// the auth proxy on `public_port`, which forwards here after the handshake
+/// succeeds. We pick `public_port + 1000` so it's predictable for log
+/// reading + clearly outside the user-facing port range.
+fn internal_rpc_port(public_port: u16) -> u16 {
+    public_port.saturating_add(1000)
+}
+
 // UDP broadcast beacon — runs alongside mDNS as a fallback for networks
 // where multicast is blocked (very common on Wi-Fi). Worker sends every
 // BEACON_INTERVAL; host listens on BEACON_PORT and ages peers out after
@@ -33,6 +41,10 @@ const BEACON_INTERVAL: Duration = Duration::from_secs(3);
 const PEER_TTL: Duration = Duration::from_secs(15);
 const BEACON_MAGIC: &str = "localmind-synapse/1";
 
+/// What we serialize and HMAC over. The signature itself rides outside this
+/// type (in `SignedBeacon`) so verification can canonicalize the body bytes
+/// independently of the JSON field order. Keeping the body stable means we
+/// can add fields later without breaking signatures across versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BeaconPayload {
     /// Magic string so we can ignore stray UDP traffic on this port.
@@ -42,6 +54,18 @@ struct BeaconPayload {
     hostname: String,
     port: u16,
     version: String,
+}
+
+/// On-the-wire envelope. `body` carries the user-visible fields; `hmac` is
+/// HMAC-SHA256(token, raw-body-bytes). Hosts that hold the token verify;
+/// hosts that don't see the peer as `verified: false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedBeacon {
+    body: BeaconPayload,
+    /// Base32-encoded HMAC of the raw `body` JSON bytes. Empty/missing on
+    /// pre-Phase-3 workers — verification just fails closed in that case.
+    #[serde(default)]
+    hmac: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +88,11 @@ pub struct SynapsePeer {
     pub port: u16,
     /// `address:port`, the exact string the host appends to `--rpc`.
     pub endpoint: String,
+    /// Phase 3 chunk E: true iff the host already has a token for this
+    /// endpoint AND the beacon's HMAC verifies under it. Hosts with no token
+    /// see this as false — they can still add the peer manually, the dialog
+    /// captures the token, and once stored verification flips on.
+    pub verified: bool,
 }
 
 struct WorkerHandle {
@@ -73,14 +102,24 @@ struct WorkerHandle {
     advertised: Option<ServiceInfo>,
     /// Beacon broadcaster task; cancelled when the worker stops.
     beacon: Option<JoinHandle<()>>,
+    /// Auth proxy task that fronts rpc-server on the public port. Cancelled
+    /// in stop_worker so the public port frees up immediately.
+    auth_proxy: Option<JoinHandle<()>>,
 }
 
 /// Beacon entry tracked on the host side. We only emit a peer-added event
 /// when we first hear from a worker, then refresh `last_seen` on each ping.
 /// A janitor task removes entries that have gone silent for PEER_TTL.
+///
+/// `last_body` and `last_hmac` are kept so `set_known_tokens` can re-verify
+/// the cached signature when a host adds a token after the fact — without
+/// them, the user would have to wait up to BEACON_INTERVAL for the next
+/// signed beacon to flip the badge from unverified to verified.
 struct BeaconEntry {
     peer: SynapsePeer,
     last_seen: Instant,
+    last_body: Option<Vec<u8>>,
+    last_hmac: String,
 }
 
 pub struct SynapseState {
@@ -94,6 +133,11 @@ pub struct SynapseState {
     /// can age them out without touching mDNS-discovered ones (mDNS does
     /// its own TTL via ServiceRemoved events).
     beacons: Mutex<HashMap<String, BeaconEntry>>,
+    /// Phase 3 chunk E: tokens the host knows about, keyed by endpoint
+    /// (`host:port`). Populated from the frontend's persisted store via
+    /// `set_known_tokens` when the Synapse page mounts. Used to verify
+    /// incoming beacon HMACs — peers with a matching token verify true.
+    peer_tokens: Mutex<HashMap<String, String>>,
 }
 
 impl SynapseState {
@@ -104,11 +148,40 @@ impl SynapseState {
                 port: DEFAULT_WORKER_PORT,
                 advertised: None,
                 beacon: None,
+                auth_proxy: None,
             }),
             daemon: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             beacons: Mutex::new(HashMap::new()),
+            peer_tokens: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Replace the host-side token map. Called from the frontend whenever
+    /// the user adds/edits a worker. Re-verifies cached peers in place so
+    /// the UI's verified badges flip immediately, without waiting for the
+    /// next beacon tick.
+    pub async fn set_known_tokens(&self, tokens: HashMap<String, String>) {
+        *self.peer_tokens.lock().await = tokens;
+        // Re-verify everything we already know about. Beacon entries store
+        // their last-seen body bytes so we can re-check HMAC without waiting
+        // 3 seconds for the next broadcast.
+        let token_map = self.peer_tokens.lock().await.clone();
+        let mut beacons = self.beacons.lock().await;
+        for entry in beacons.values_mut() {
+            entry.peer.verified = entry
+                .last_body
+                .as_ref()
+                .and_then(|body| token_map.get(&entry.peer.endpoint).map(|t| (body, t)))
+                .map(|(body, token)| {
+                    crate::synapse_proto::hmac_verify(token, body, &entry.last_hmac)
+                })
+                .unwrap_or(false);
+        }
+        // mDNS entries don't carry signatures yet (mdns-sd TXT records have
+        // size limits we don't want to fight in this pass), so they always
+        // remain unverified. They show alongside beacon entries in the UI;
+        // the user can still add them, just without the verified badge.
     }
 
     pub async fn status(&self) -> SynapseWorkerStatus {
@@ -144,6 +217,9 @@ impl SynapseState {
         if let Some(handle) = w.beacon.take() {
             handle.abort();
         }
+        if let Some(handle) = w.auth_proxy.take() {
+            handle.abort();
+        }
         if let Some(info) = w.advertised.take() {
             if let Some(d) = self.daemon.lock().await.as_ref() {
                 let _ = d.unregister(info.get_fullname());
@@ -163,8 +239,12 @@ impl SynapseState {
         binaries::ensure_llama_server(app).await?;
 
         self.stop_worker().await?;
-        let port = port.unwrap_or(DEFAULT_WORKER_PORT);
-        crate::llama::kill_orphan_on_port(port).await;
+        let public_port = port.unwrap_or(DEFAULT_WORKER_PORT);
+        let internal_port = internal_rpc_port(public_port);
+        // Both ports might be left over from a previous crash. Clean public
+        // for the auth proxy and internal for rpc-server itself.
+        crate::llama::kill_orphan_on_port(public_port).await;
+        crate::llama::kill_orphan_on_port(internal_port).await;
 
         let binary = config::rpc_server_path();
         if !binary.exists() {
@@ -174,13 +254,13 @@ impl SynapseState {
             ));
         }
 
-        // Bind to 0.0.0.0 so other machines on the LAN can connect; the host
-        // typed our address into its workers field. There's no auth on the RPC
-        // wire (Phase 3 will fix that with an auth shim) — only run worker
-        // mode on networks you control.
+        // Phase 3: bind rpc-server to 127.0.0.1 only. The world reaches us
+        // through the auth proxy (below), which gates by token before any
+        // byte hits this process. llama.cpp's startup banner about "never
+        // expose the RPC server" is now satisfied — we never do.
         let mut cmd = Command::new(&binary);
-        cmd.arg("-H").arg("0.0.0.0");
-        cmd.arg("-p").arg(port.to_string());
+        cmd.arg("-H").arg("127.0.0.1");
+        cmd.arg("-p").arg(internal_port.to_string());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -189,12 +269,34 @@ impl SynapseState {
             .map_err(|e| anyhow!("failed to spawn rpc-server: {e}"))?;
         pipe_output(app, &mut child);
 
+        // Spin up the auth proxy on the public-facing port. If this fails
+        // (port in use, firewall, etc.) we kill the rpc-server child we just
+        // spawned — leaving it running on localhost would create a confusing
+        // half-up state where the worker burns RAM but nobody can reach it.
+        let token = synapse_token::load_or_create()
+            .map_err(|e| anyhow!("failed to load worker token: {e}"))?;
+        let proxy_handle = match auth_proxy::spawn_auth_proxy(
+            app.clone(),
+            public_port,
+            internal_port,
+            token,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(e);
+            }
+        };
+
         // Advertise on mDNS so the host's Synapse page picks us up automatically.
         // Best-effort: if advertising fails (e.g. no multicast on this NIC, or
         // hostname has chars mdns-sd refuses) the worker still works, the host
         // just has to type the IP manually. Surface the failure as a synapse:log
         // line so the UI can show *why* discovery isn't happening.
-        let advertised = match self.advertise(port).await {
+        let advertised = match self.advertise(public_port).await {
             Ok(info) => {
                 let addrs = info
                     .get_addresses()
@@ -210,7 +312,7 @@ impl SynapseState {
                             "mDNS advertise OK: {} on {} (port {})",
                             info.get_fullname(),
                             if addrs.is_empty() { "<no addr>".to_string() } else { addrs },
-                            port,
+                            public_port,
                         ),
                     }),
                 );
@@ -232,7 +334,7 @@ impl SynapseState {
         // client isolation, Windows machines on Public profile, corp Wi-Fi…).
         // Beacon uses 255.255.255.255, which is far more permissive on most
         // networks than 224.0.0.251 multicast.
-        let beacon_handle = match spawn_beacon(app.clone(), port).await {
+        let beacon_handle = match spawn_beacon(app.clone(), public_port).await {
             Ok(h) => Some(h),
             Err(e) => {
                 let msg = format!("UDP beacon failed: {e}");
@@ -248,12 +350,13 @@ impl SynapseState {
         {
             let mut w = self.worker.lock().await;
             w.child = Some(child);
-            w.port = port;
+            w.port = public_port;
             w.advertised = advertised;
             w.beacon = beacon_handle;
+            w.auth_proxy = Some(proxy_handle);
         }
 
-        let _ = app.emit("synapse:ready", serde_json::json!({ "port": port }));
+        let _ = app.emit("synapse:ready", serde_json::json!({ "port": public_port }));
 
         Ok(self.status().await)
     }
@@ -342,6 +445,11 @@ impl SynapseState {
                             address,
                             port,
                             endpoint,
+                            // mDNS TXT records don't carry our HMAC (size
+                            // limits + cache-friendliness). Beacons are the
+                            // authenticated channel; mDNS-only peers stay
+                            // unverified in the UI.
+                            verified: false,
                         };
                         me.peers.lock().await.insert(id, peer.clone());
                         let _ = app.emit("synapse:peer-added", &peer);
@@ -486,7 +594,18 @@ async fn spawn_beacon(app: AppHandle, port: u16) -> Result<JoinHandle<()>> {
         port,
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let bytes = serde_json::to_vec(&payload).map_err(|e| anyhow!("beacon serialize: {e}"))?;
+    // Phase 3 chunk E: HMAC-sign the canonical body. Hosts that have our
+    // token verify; hosts that don't see us as unverified. The signature
+    // is computed over the body bytes specifically (not the wrapped
+    // SignedBeacon) so JSON field re-ordering can't affect it.
+    let body_bytes = serde_json::to_vec(&payload).map_err(|e| anyhow!("beacon body: {e}"))?;
+    let token = crate::synapse_token::load_or_create().map_err(|e| anyhow!("beacon token: {e}"))?;
+    let hmac = crate::synapse_proto::hmac_sign(&token, &body_bytes);
+    let signed = SignedBeacon {
+        body: payload,
+        hmac,
+    };
+    let bytes = serde_json::to_vec(&signed).map_err(|e| anyhow!("beacon serialize: {e}"))?;
 
     // Bind to an ephemeral port; we only ever send. Setting broadcast on the
     // socket lets us hit the limited-broadcast address 255.255.255.255.
@@ -546,9 +665,13 @@ async fn run_beacon_listener(state: Arc<SynapseState>, app: AppHandle, sock: Udp
             Ok(v) => v,
             Err(_) => continue,
         };
-        let payload: BeaconPayload = match serde_json::from_slice(&buf[..n]) {
-            Ok(p) => p,
-            Err(_) => continue,
+        // Try the new SignedBeacon shape first; if that fails, parse as a
+        // bare BeaconPayload for backwards compatibility with workers still
+        // running pre-chunk-E builds. Either way the peer shows up — the
+        // unsigned variant just stays unverified.
+        let (payload, body_bytes, hmac) = match parse_beacon(&buf[..n]) {
+            Some(parsed) => parsed,
+            None => continue,
         };
         if payload.magic != BEACON_MAGIC {
             continue;
@@ -559,12 +682,28 @@ async fn run_beacon_listener(state: Arc<SynapseState>, app: AppHandle, sock: Udp
 
         let address = src.ip().to_string();
         let endpoint = format!("{}:{}", address, payload.port);
+
+        // Verify the signature if we already have the worker's token. Hosts
+        // that haven't paired yet see verified=false; once the user pastes
+        // the token via the dialog, set_known_tokens flips this to true on
+        // the cached entries without waiting for the next beacon.
+        let verified = if hmac.is_empty() {
+            false
+        } else {
+            let tokens = state.peer_tokens.lock().await;
+            tokens
+                .get(&endpoint)
+                .map(|t| crate::synapse_proto::hmac_verify(t, &body_bytes, &hmac))
+                .unwrap_or(false)
+        };
+
         let peer = SynapsePeer {
             id: payload.id.clone(),
             hostname: payload.hostname.clone(),
             address,
             port: payload.port,
             endpoint,
+            verified,
         };
 
         // Insert or refresh. Only fire peer-added on first sight; refreshes
@@ -576,6 +715,8 @@ async fn run_beacon_listener(state: Arc<SynapseState>, app: AppHandle, sock: Udp
             BeaconEntry {
                 peer: peer.clone(),
                 last_seen: Instant::now(),
+                last_body: Some(body_bytes),
+                last_hmac: hmac,
             },
         );
         drop(beacons);
@@ -583,6 +724,27 @@ async fn run_beacon_listener(state: Arc<SynapseState>, app: AppHandle, sock: Udp
             let _ = app.emit("synapse:peer-added", &peer);
         }
     }
+}
+
+/// Parse a beacon datagram. Tries the signed envelope first, then falls back
+/// to a bare body for older workers. Returns `(payload, body-bytes, hmac)` —
+/// the body bytes are needed to re-verify HMAC later when a token arrives.
+fn parse_beacon(buf: &[u8]) -> Option<(BeaconPayload, Vec<u8>, String)> {
+    if let Ok(signed) = serde_json::from_slice::<SignedBeacon>(buf) {
+        // Re-serialize the body bytes in canonical form so verification on a
+        // later set_known_tokens() call uses the exact same input the worker
+        // signed. We can't trust the original packet bytes here because
+        // the SignedBeacon envelope wrapped them with the hmac field.
+        if let Ok(body_bytes) = serde_json::to_vec(&signed.body) {
+            return Some((signed.body, body_bytes, signed.hmac));
+        }
+    }
+    if let Ok(payload) = serde_json::from_slice::<BeaconPayload>(buf) {
+        if let Ok(body_bytes) = serde_json::to_vec(&payload) {
+            return Some((payload, body_bytes, String::new()));
+        }
+    }
+    None
 }
 
 /// Periodically prune beacon entries whose last_seen is older than PEER_TTL.
