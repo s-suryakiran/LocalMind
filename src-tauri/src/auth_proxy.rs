@@ -23,12 +23,22 @@
 // upstream protocol.
 
 use crate::synapse_proto::{self, HandshakeResponse, PROTOCOL_VERSION};
+use crate::synapse_tls;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+
+/// Phase 4 chunk O: live count of authenticated client connections.
+/// Process-global because there's only ever one auth proxy running per
+/// app, and exposing it as a simple atomic avoids threading a
+/// `SynapseState` reference into every per-connection task.
+pub static ACTIVE_SESSIONS: AtomicU32 = AtomicU32::new(0);
 
 /// What we tell the UI when a client tries to connect. Front-end mirrors
 /// these into the live-logs panel and a future "active connections" badge.
@@ -63,9 +73,20 @@ pub async fn spawn_auth_proxy(
     let listener = TcpListener::bind(("0.0.0.0", public_port))
         .await
         .map_err(|e| anyhow!("auth proxy bind 0.0.0.0:{public_port}: {e}"))?;
+
+    // Phase 4 chunk N: every accepted connection gets wrapped in TLS before
+    // we read a single application byte. The handshake JSON, token, and
+    // raw rpc traffic all flow inside the TLS tunnel. Build the acceptor
+    // once and clone the Arc per-connection.
+    let (certs, key, fingerprint) = synapse_tls::load_or_create_cert()?;
+    let tls_config = synapse_tls::server_config(certs, key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     log_info(
         &app,
-        &format!("auth proxy listening on 0.0.0.0:{public_port} → 127.0.0.1:{internal_port}"),
+        &format!(
+            "auth proxy listening on 0.0.0.0:{public_port} → 127.0.0.1:{internal_port} (TLS, fp={})",
+            &fingerprint[..16]
+        ),
     );
 
     let handle = tokio::spawn(async move {
@@ -74,10 +95,27 @@ pub async fn spawn_auth_proxy(
                 Ok((client, peer)) => {
                     let app = app.clone();
                     let token = token.clone();
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         let peer_str = peer.to_string();
+                        // Wrap in TLS first. A peer that doesn't speak TLS
+                        // (e.g. a port scanner sending raw HTTP) gets a
+                        // clean drop here without ever reaching the
+                        // application layer.
+                        let tls_stream = match acceptor.accept(client).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                emit_auth(
+                                    &app,
+                                    AuthEventKind::Rejected,
+                                    &peer_str,
+                                    Some(format!("tls handshake: {e}")),
+                                );
+                                return;
+                            }
+                        };
                         if let Err(e) =
-                            handle_client(client, &token, internal_port, &app, &peer_str).await
+                            handle_client(tls_stream, &token, internal_port, &app, &peer_str).await
                         {
                             // Swallow the error here so a single misbehaving
                             // peer doesn't take down the whole proxy. Most
@@ -99,7 +137,7 @@ pub async fn spawn_auth_proxy(
 }
 
 async fn handle_client(
-    mut client: TcpStream,
+    mut client: tokio_rustls::server::TlsStream<TcpStream>,
     expected_token: &str,
     internal_port: u16,
     app: &AppHandle,
@@ -185,6 +223,13 @@ async fn handle_client(
         }
     };
 
+    // Phase 4 chunk O: bump the session counter at accept, decrement at
+    // disconnect. We do this *after* the upstream dial succeeds so half-
+    // open dial failures don't show up as ghost sessions. The
+    // increment/decrement is wrapped to make the dec happen even on panic
+    // via a guard struct.
+    let _guard = SessionGuard::enter(app);
+
     emit_auth(app, AuthEventKind::Accepted, peer, None);
 
     // Phase 3: bidirectional byte copy. tokio's helper is the right tool —
@@ -197,6 +242,35 @@ async fn handle_client(
 
     emit_auth(app, AuthEventKind::Disconnected, peer, None);
     Ok(())
+}
+
+/// RAII session counter. Increments on construction, decrements + emits a
+/// fresh count on drop — including on panic, so a misbehaving rpc-server
+/// can't strand the counter at a wrong value.
+struct SessionGuard {
+    app: AppHandle,
+}
+
+impl SessionGuard {
+    fn enter(app: &AppHandle) -> Self {
+        let count = ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = app.emit("synapse:sessions", serde_json::json!({ "count": count }));
+        Self { app: app.clone() }
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        // saturating_sub-ish: subtract 1 but never wrap. If something else
+        // miscounted (impossible today, but cheap insurance), clamp to 0.
+        let prev = ACTIVE_SESSIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            Some(c.saturating_sub(1))
+        });
+        let count = prev.map(|p| p.saturating_sub(1)).unwrap_or(0);
+        let _ = self
+            .app
+            .emit("synapse:sessions", serde_json::json!({ "count": count }));
+    }
 }
 
 fn emit_auth(app: &AppHandle, kind: AuthEventKind, peer: &str, reason: Option<String>) {

@@ -45,6 +45,12 @@ const BEACON_MAGIC: &str = "localmind-synapse/1";
 /// type (in `SignedBeacon`) so verification can canonicalize the body bytes
 /// independently of the JSON field order. Keeping the body stable means we
 /// can add fields later without breaking signatures across versions.
+///
+/// Phase 4 chunk J: hardware fields (vram_gb, accelerator_kind) so the host
+/// can show real per-worker capacity in the marketplace and Synapse UI
+/// instead of the 4-GB-per-peer guess from Phase 3. All hardware fields are
+/// optional so older workers (no fields → None) keep working with no
+/// special-casing on the host side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BeaconPayload {
     /// Magic string so we can ignore stray UDP traffic on this port.
@@ -54,6 +60,23 @@ struct BeaconPayload {
     hostname: String,
     port: u16,
     version: String,
+    /// VRAM (or unified memory share) advertised in GB, rounded to 1 decimal.
+    /// Hosts use this to size their Synapse-cluster memory budget.
+    #[serde(default)]
+    vram_gb: Option<f32>,
+    /// Short tag for the accelerator kind: "apple", "nvidia", "amd",
+    /// "intel-arc", "cpu". UI uses it to pick an icon.
+    #[serde(default)]
+    accelerator_kind: Option<String>,
+    /// Friendly accelerator description ("Apple M1 Pro", "NVIDIA RTX 5070 Ti")
+    /// for the chip subtitle.
+    #[serde(default)]
+    accelerator_name: Option<String>,
+    /// Phase 4 chunk N: SHA-256 hex fingerprint of the worker's TLS cert.
+    /// Rides inside the HMAC-signed body so a man-in-the-middle can't
+    /// substitute their own fingerprint without invalidating the signature.
+    #[serde(default)]
+    cert_fingerprint: Option<String>,
 }
 
 /// On-the-wire envelope. `body` carries the user-visible fields; `hmac` is
@@ -93,6 +116,15 @@ pub struct SynapsePeer {
     /// see this as false — they can still add the peer manually, the dialog
     /// captures the token, and once stored verification flips on.
     pub verified: bool,
+    /// Phase 4 chunk J: hardware advertised in the beacon. Pre-Phase-4
+    /// workers leave these as None.
+    pub vram_gb: Option<f32>,
+    pub accelerator_kind: Option<String>,
+    pub accelerator_name: Option<String>,
+    /// Phase 4 chunk N: SHA-256 fingerprint of the worker's TLS cert.
+    /// The host pins this on first pair so a same-IP attacker can't
+    /// impersonate the worker even with the token.
+    pub cert_fingerprint: Option<String>,
 }
 
 struct WorkerHandle {
@@ -450,6 +482,16 @@ impl SynapseState {
                             // authenticated channel; mDNS-only peers stay
                             // unverified in the UI.
                             verified: false,
+                            // mDNS path also doesn't carry the new chunk-J
+                            // hardware fields — those ride only on the
+                            // signed beacon. The same peer typically
+                            // surfaces via both routes; list_peers dedupes
+                            // by endpoint and keeps the beacon's richer
+                            // metadata.
+                            vram_gb: None,
+                            accelerator_kind: None,
+                            accelerator_name: None,
+                            cert_fingerprint: None,
                         };
                         me.peers.lock().await.insert(id, peer.clone());
                         let _ = app.emit("synapse:peer-added", &peer);
@@ -587,12 +629,65 @@ async fn spawn_beacon(app: AppHandle, port: u16) -> Result<JoinHandle<()>> {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "localmind".to_string());
     let id = format!("beacon:{}-{}", sanitize_dns_label(&raw_host), port);
+    // Phase 4 chunk J: snapshot hardware once at start. We don't refresh
+    // mid-session — VRAM doesn't change, and re-detecting on every tick
+    // would be wasted CPU. If a user moves models around the host's
+    // marketplace re-renders on the next set_known_tokens push anyway.
+    let hw = crate::hardware::detect();
+    let (acc_kind, acc_name, vram_gb) = match &hw.accelerator {
+        crate::hardware::Accelerator::AppleSilicon {
+            chip,
+            unified_memory_gb,
+        } => (
+            Some("apple".to_string()),
+            Some(format!("Apple {chip}")),
+            // Apple unified memory: budget the GPU usefully gets is
+            // ~75% before macOS pushes back hard. Match what the host
+            // marketplace heuristic uses for self.
+            Some((*unified_memory_gb as f32) * 0.75),
+        ),
+        crate::hardware::Accelerator::Nvidia { name, vram_gb, .. } => (
+            Some("nvidia".to_string()),
+            Some(name.clone()),
+            Some(*vram_gb as f32),
+        ),
+        crate::hardware::Accelerator::Amd { name, vram_gb } => (
+            Some("amd".to_string()),
+            Some(name.clone()),
+            Some(*vram_gb as f32),
+        ),
+        crate::hardware::Accelerator::IntelArc { name } => {
+            (Some("intel-arc".to_string()), Some(name.clone()), None)
+        }
+        crate::hardware::Accelerator::Cpu => (
+            Some("cpu".to_string()),
+            Some(hw.cpu_name.clone()),
+            // CPU-only: advertise system RAM minus a 4 GB OS reserve so
+            // the host's budget calc treats this peer like a CPU node.
+            Some(((hw.total_memory_gb - 4.0).max(0.0)) as f32),
+        ),
+    };
+    // Phase 4 chunk N: include the cert fingerprint so paired hosts can
+    // pin TLS verification on next connect. Best-effort — if cert load
+    // fails (read-only data dir, e.g.), advertise None and the host falls
+    // back to TOFU.
+    let cert_fingerprint = match crate::synapse_tls::load_or_create_cert() {
+        Ok((_, _, fp)) => Some(fp),
+        Err(e) => {
+            eprintln!("synapse: TLS cert load failed: {e}");
+            None
+        }
+    };
     let payload = BeaconPayload {
         magic: BEACON_MAGIC.to_string(),
         id,
         hostname: raw_host,
         port,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        vram_gb,
+        accelerator_kind: acc_kind,
+        accelerator_name: acc_name,
+        cert_fingerprint,
     };
     // Phase 3 chunk E: HMAC-sign the canonical body. Hosts that have our
     // token verify; hosts that don't see us as unverified. The signature
@@ -704,6 +799,10 @@ async fn run_beacon_listener(state: Arc<SynapseState>, app: AppHandle, sock: Udp
             port: payload.port,
             endpoint,
             verified,
+            vram_gb: payload.vram_gb,
+            accelerator_kind: payload.accelerator_kind.clone(),
+            accelerator_name: payload.accelerator_name.clone(),
+            cert_fingerprint: payload.cert_fingerprint.clone(),
         };
 
         // Insert or refresh. Only fire peer-added on first sight; refreshes

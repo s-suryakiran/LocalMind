@@ -25,6 +25,13 @@ pub struct SynapseWorker {
     /// `None` (or 0.0) means "use llama.cpp's default" — even split.
     #[serde(default)]
     pub weight: Option<f32>,
+    /// Phase 4 chunk N: pinned cert fingerprint. The host's TLS verifier
+    /// rejects any cert that doesn't match this hash, so a peer at the
+    /// same IP can't impersonate the worker even if it learns the token.
+    /// Captured by the host on first pairing from the (HMAC-verified)
+    /// beacon. `None` means "fall back to first-seen TOFU on connect."
+    #[serde(default)]
+    pub cert_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -196,7 +203,11 @@ impl LlamaState {
                 if endpoint.is_empty() {
                     continue;
                 }
-                match self.host_proxy.start(app, endpoint, &w.token).await {
+                match self
+                    .host_proxy
+                    .start(app, endpoint, &w.token, w.cert_fingerprint.as_deref())
+                    .await
+                {
                     Ok(local) => {
                         local_addrs.push(local);
                         active_workers.push(w);
@@ -224,9 +235,14 @@ impl LlamaState {
                     || active_workers.iter().any(|w| w.weight.is_some());
                 if any_explicit {
                     let mut weights: Vec<f32> = Vec::with_capacity(active_workers.len() + 1);
-                    weights.push(settings.host_weight.unwrap_or(1.0).max(0.0));
+                    // Default 0.5 matches the UI slider's visual resting
+                    // position. `unwrap_or(1.0)` made an untouched worker
+                    // silently outweigh a host the user had dialed back to
+                    // a low value, which inverted the layer split versus
+                    // what the sliders showed.
+                    weights.push(settings.host_weight.unwrap_or(0.5).max(0.0));
                     for w in &active_workers {
-                        weights.push(w.weight.unwrap_or(1.0).max(0.0));
+                        weights.push(w.weight.unwrap_or(0.5).max(0.0));
                     }
                     // Normalize so the user can think in percentages without
                     // worrying about the sum. llama.cpp accepts comma-
@@ -341,6 +357,11 @@ fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
         let tag = tag.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            // Phase 4 chunk Q: cluster-viz layout state. Collect device-
+            // buffer lines as they stream and flush a single layout event
+            // when llama-server signals load completion. One render
+            // instead of N flickering ones.
+            let mut device_buffers: Vec<(String, u64)> = Vec::new();
             while let Ok(Some(line)) = lines.next_line().await {
                 // Phase 3 chunk F1: tok/s parser. llama.cpp's per-request
                 // timing block looks like:
@@ -362,6 +383,30 @@ fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
                             }),
                         );
                     }
+                    if let Some((device, mb)) = parse_buffer_line(&line) {
+                        device_buffers.push((device, mb));
+                    }
+                    // Heralds load-complete: emit one layout event with
+                    // every device-buffer we collected, then clear so a
+                    // model reload starts fresh.
+                    if !device_buffers.is_empty()
+                        && (line.contains("model loaded")
+                            || line.contains("loaded successfully")
+                            || line.contains("HTTP server listening")
+                            || line.contains("starting the main loop"))
+                    {
+                        let _ = app.emit(
+                            "synapse:cluster-layout",
+                            serde_json::json!({
+                                "devices": device_buffers
+                                    .iter()
+                                    .map(|(d, mb)| serde_json::json!({ "device": d, "mb": mb }))
+                                    .collect::<Vec<_>>(),
+                                "ts": now_ms(),
+                            }),
+                        );
+                        device_buffers.clear();
+                    }
                 }
                 let _ = app.emit(
                     "llama:log",
@@ -370,6 +415,35 @@ fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
             }
         });
     }
+}
+
+/// Phase 4 chunk Q: extract a (device, MiB) pair from llama.cpp's tensor-
+/// loading log. Real lines look like:
+///
+///     load_tensors: CUDA0 model buffer size = 12345.67 MiB
+///     load_tensors: CPU model buffer size  =   234.56 MiB
+///     load_tensors: RPC[127.0.0.1:54712] model buffer size = 9876.54 MiB
+///
+/// Returns None for unrelated lines. We deliberately key off "model buffer
+/// size" rather than just "buffer size" because llama.cpp also prints
+/// transient KV-cache sizes that aren't part of the layout snapshot.
+fn parse_buffer_line(line: &str) -> Option<(String, u64)> {
+    if !line.contains("model buffer size") {
+        return None;
+    }
+    let after_prefix = line.split_once("load_tensors:").map(|(_, r)| r)?;
+    let (device_part, size_part) = after_prefix.split_once("model buffer size")?;
+    let device = device_part.trim().to_string();
+    if device.is_empty() {
+        return None;
+    }
+    let num: String = size_part
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mb: f64 = num.parse().ok()?;
+    Some((device, mb as u64))
 }
 
 /// Extract `tokens per second` from an llama.cpp eval-time log line, e.g.
@@ -473,7 +547,32 @@ async fn wait_ready(port: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_eval_tok_per_sec;
+    use super::{parse_buffer_line, parse_eval_tok_per_sec};
+
+    #[test]
+    fn parses_buffer_lines_real_format() {
+        let cuda = "load_tensors: CUDA0 model buffer size = 12345.67 MiB";
+        assert_eq!(parse_buffer_line(cuda), Some(("CUDA0".to_string(), 12345)));
+
+        let cpu = "load_tensors: CPU model buffer size  =   234.56 MiB";
+        assert_eq!(parse_buffer_line(cpu), Some(("CPU".to_string(), 234)));
+
+        let rpc = "load_tensors: RPC[127.0.0.1:54712] model buffer size = 9876.54 MiB";
+        assert_eq!(
+            parse_buffer_line(rpc),
+            Some(("RPC[127.0.0.1:54712]".to_string(), 9876))
+        );
+    }
+
+    #[test]
+    fn rejects_kv_cache_and_unrelated_lines() {
+        assert_eq!(
+            parse_buffer_line("llama_kv_cache: CUDA0 KV buffer size = 256 MiB"),
+            None
+        );
+        assert_eq!(parse_buffer_line("loading model"), None);
+        assert_eq!(parse_buffer_line(""), None);
+    }
 
     #[test]
     fn parses_eval_tok_per_sec_real_format() {

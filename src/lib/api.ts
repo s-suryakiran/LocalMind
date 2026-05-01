@@ -57,6 +57,27 @@ export async function remoteStatus(): Promise<LlamaStatus> {
   return res.json();
 }
 
+/// Phase 4 chunk P: read-only Synapse fetchers for the phone PWA. Always
+/// hit the paired desktop's LAN API — there's no desktop equivalent
+/// because desktop already has Tauri-IPC versions on `api`. Returning
+/// nullable so a transient LAN hiccup is visible (state goes empty)
+/// rather than throwing into an unhandled-promise hole.
+async function lanGet<T>(path: string): Promise<T> {
+  const c = connection();
+  if (!c) throw new Error("not connected");
+  const res = await fetch(`${c.url.replace(/\/+$/, "")}${path}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return res.json();
+}
+
+export const remoteSynapse = {
+  status: () => lanGet<{ running: boolean; port: number; pid: number | null }>("/api/synapse/status"),
+  peers: () => lanGet<import("./types").SynapsePeer[]>("/api/synapse/peers"),
+  sessions: () => lanGet<{ count: number }>("/api/synapse/sessions"),
+};
+
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri()) {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -118,6 +139,7 @@ export const api = {
   rotateSynapseToken: () => invoke<string>("rotate_synapse_token"),
   setKnownSynapseTokens: (tokens: Record<string, string>) =>
     invoke<void>("set_known_synapse_tokens", { tokens }),
+  synapseActiveSessions: () => invoke<number>("synapse_active_sessions"),
 };
 
 export type ChatContentPart =

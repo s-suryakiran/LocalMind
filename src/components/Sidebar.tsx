@@ -70,7 +70,8 @@ export function Sidebar({
         {!remote && <NavItem icon={<Boxes size={15} />} label="My models" active={view === "models"} onClick={onPick(() => setView("models"))} />}
         {!remote && <NavItem icon={<BookOpen size={15} />} label="Knowledge" active={view === "knowledge"} onClick={onPick(() => setView("knowledge"))} />}
         {!remote && <NavItem icon={<ImageIcon size={15} />} label="Images" active={view === "image"} onClick={onPick(() => setView("image"))} />}
-        {!remote && <NavItem icon={<Network size={15} />} label="Synapse" active={view === "synapse"} onClick={onPick(() => setView("synapse"))} />}
+        {/* Phase 4 chunk P: Synapse is now read-only available on phone too. */}
+        <NavItem icon={<Network size={15} />} label="Synapse" active={view === "synapse"} onClick={onPick(() => setView("synapse"))} />
         <NavItem icon={<SettingsIcon size={15} />} label="Settings" active={view === "settings"} onClick={onPick(() => setView("settings"))} />
       </nav>
 

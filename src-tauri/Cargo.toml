@@ -53,6 +53,13 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = { version = "0.8", features = ["std_rng"] }
 subtle = "2"
+# Phase 4 chunk N: TLS on the Synapse proxy. rcgen generates the self-
+# signed cert; tokio-rustls wraps the TCP streams. We pin the rustls
+# version explicitly because rcgen tracks it.
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
 
 [profile.release]
 lto = true
