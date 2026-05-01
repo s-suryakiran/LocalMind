@@ -235,9 +235,14 @@ impl LlamaState {
                     || active_workers.iter().any(|w| w.weight.is_some());
                 if any_explicit {
                     let mut weights: Vec<f32> = Vec::with_capacity(active_workers.len() + 1);
-                    weights.push(settings.host_weight.unwrap_or(1.0).max(0.0));
+                    // Default 0.5 matches the UI slider's visual resting
+                    // position. `unwrap_or(1.0)` made an untouched worker
+                    // silently outweigh a host the user had dialed back to
+                    // a low value, which inverted the layer split versus
+                    // what the sliders showed.
+                    weights.push(settings.host_weight.unwrap_or(0.5).max(0.0));
                     for w in &active_workers {
-                        weights.push(w.weight.unwrap_or(1.0).max(0.0));
+                        weights.push(w.weight.unwrap_or(0.5).max(0.0));
                     }
                     // Normalize so the user can think in percentages without
                     // worrying about the sum. llama.cpp accepts comma-

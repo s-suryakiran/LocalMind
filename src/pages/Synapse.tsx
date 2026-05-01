@@ -320,6 +320,14 @@ export function Synapse() {
 
   function commitWorkersText(text: string) {
     setWorkersText(text);
+    // Preserve weight + certFingerprint for any endpoint that already exists
+    // in the store. The textarea only carries `endpoint|token` — without this
+    // merge, every keystroke in the bulk-import textarea silently wiped the
+    // pinned cert and the layer-split weight, which is the path that made
+    // the second model load skip the worker (no fingerprint → TOFU; no
+    // weight → backend used a default that didn't match the UI).
+    const existingByEndpoint: Record<string, SynapseWorker> = {};
+    for (const w of synapse.workers) existingByEndpoint[w.endpoint] = w;
     const parsed: SynapseWorker[] = text
       .split(/[,\n]/)
       .map((s) => s.trim())
@@ -330,10 +338,14 @@ export function Synapse() {
         // entirely — host_proxy will fail-fast at load time with a clear
         // "no token configured for X" error.
         const sep = line.indexOf("|");
-        if (sep === -1) return { endpoint: line, token: "" };
+        const endpoint = sep === -1 ? line : line.slice(0, sep).trim();
+        const token = sep === -1 ? "" : line.slice(sep + 1).trim();
+        const prev = existingByEndpoint[endpoint];
         return {
-          endpoint: line.slice(0, sep).trim(),
-          token: line.slice(sep + 1).trim(),
+          endpoint,
+          token,
+          weight: prev?.weight,
+          certFingerprint: prev?.certFingerprint,
         };
       });
     setSynapseWorkers(parsed);
@@ -404,15 +416,6 @@ export function Synapse() {
     const next = synapse.workers.filter((w) => w.endpoint !== endpoint);
     setSynapseWorkers(next);
     setWorkersText(workersToText(next));
-  }
-
-  // Phase 3 chunk G: update one worker's weight in the layer split. Stored
-  // as 0–1 in the SynapseWorker type but presented as 0–100 in the UI.
-  function setWorkerWeight(endpoint: string, value01: number) {
-    const next = synapse.workers.map((w) =>
-      w.endpoint === endpoint ? { ...w, weight: value01 } : w,
-    );
-    setSynapseWorkers(next);
   }
 
   // Reset every weight, including host's, back to "use llama.cpp default".
@@ -880,20 +883,39 @@ export function Synapse() {
           {/* Layer split (--tensor-split). Lets users override llama.cpp's
               even-split default — important when host and worker have very
               different compute (e.g. M1 Pro host + 4090 worker → most layers
-              should land on the 4090). Hidden in <details> so the common
-              case (default split) doesn't get cluttered with sliders. */}
+              should land on the 4090). Donut + numeric % inputs that always
+              sum to 100, so what the user types is what gets loaded. */}
           {synapse.workers.length > 0 && (() => {
-            // Compute display percentages from the explicit weights. Sliders
-            // bind to raw 0–100 values; we do the normalization to a sum of
-            // 1.0 in the backend when building --tensor-split.
-            const hostW = synapse.hostWeight ?? 0;
-            const workerWs = synapse.workers.map((w) => w.weight ?? 0);
-            const total = hostW + workerWs.reduce((a, b) => a + b, 0);
-            const pct = (v: number) =>
-              total > 0 ? Math.round((v / total) * 100) : 0;
             const anyExplicit =
               synapse.hostWeight !== undefined ||
               synapse.workers.some((w) => w.weight !== undefined);
+            // Build the array of percentages the editor binds to. When no
+            // weights are set, show an even split as the implicit default
+            // — matches llama.cpp's behavior when --tensor-split is omitted.
+            const n = synapse.workers.length + 1;
+            const rawWeights = [
+              synapse.hostWeight ?? 1 / n,
+              ...synapse.workers.map((w) => w.weight ?? 1 / n),
+            ];
+            const sum = rawWeights.reduce((a, b) => a + b, 0) || 1;
+            const pcts = rawWeights.map((w) => (w / sum) * 100);
+            const labels = [
+              "This machine (host)",
+              ...synapse.workers.map((w) => w.endpoint),
+            ];
+
+            const applyPcts = (next: number[]) => {
+              // Backend already normalizes, but we store a sum-to-1 fraction
+              // so the percentage we showed is exactly the percentage that
+              // gets loaded. No silent re-scaling between UI and inference.
+              setSynapseHostWeight(next[0] / 100);
+              const w2 = synapse.workers.map((w, i) => ({
+                ...w,
+                weight: next[i + 1] / 100,
+              }));
+              setSynapseWorkers(w2);
+            };
+
             return (
               <details className="mt-4 group" open={anyExplicit}>
                 <summary className="text-xs text-[var(--color-text-muted)] cursor-pointer select-none hover:text-[var(--color-text)] flex items-center justify-between">
@@ -927,27 +949,17 @@ export function Synapse() {
                     )}
                   </span>
                 </summary>
-                <div className="mt-2 flex flex-col gap-2">
-                  <SplitSlider
-                    label="This machine (host)"
-                    value01={synapse.hostWeight ?? 0.5}
-                    pct={anyExplicit ? pct(hostW) : null}
-                    onChange={(v) => setSynapseHostWeight(v)}
+                <div className="mt-3">
+                  <SplitDonut
+                    labels={labels}
+                    pcts={pcts}
+                    onChange={applyPcts}
                   />
-                  {synapse.workers.map((w, i) => (
-                    <SplitSlider
-                      key={w.endpoint}
-                      label={w.endpoint}
-                      value01={w.weight ?? 0.5}
-                      pct={anyExplicit ? pct(workerWs[i]) : null}
-                      onChange={(v) => setWorkerWeight(w.endpoint, v)}
-                    />
-                  ))}
-                  <div className="text-[11px] text-[var(--color-text-subtle)] mt-1 leading-snug">
-                    Higher = more layers on that device. Values are normalized
-                    to a fraction; the actual layer count is rounded to the
-                    nearest integer at load time. Reset to fall back to
-                    llama.cpp's default heuristic.
+                  <div className="text-[11px] text-[var(--color-text-subtle)] mt-2 leading-snug">
+                    Editing one value rebalances the others proportionally
+                    so the total stays 100%. The actual layer count is
+                    rounded to the nearest integer at load time. Reset to
+                    fall back to llama.cpp's default heuristic.
                   </div>
                 </div>
               </details>
@@ -1079,39 +1091,184 @@ function Section({
   );
 }
 
-/// One row of the layer-split editor: label + slider + computed %. The slider
-/// binds to a raw 0–1 weight; normalization to a sum of 1 happens in the
-/// backend so the UI doesn't have to coordinate state across N rows.
-function SplitSlider({
-  label,
-  value01,
-  pct,
+/// Layer-split editor: donut chart + per-device numeric % inputs that always
+/// sum to 100. Editing one input redistributes the delta across the others
+/// proportionally to their current shares, so the user always sees the
+/// exact percentage that will be loaded.
+function SplitDonut({
+  labels,
+  pcts,
   onChange,
 }: {
-  label: string;
-  value01: number;
-  pct: number | null;
-  onChange: (v: number) => void;
+  labels: string[];
+  pcts: number[];
+  onChange: (next: number[]) => void;
 }) {
+  // Tailwind doesn't help here — we need real CSS color values for SVG
+  // strokes and the swatch dots. Picked a small, distinct palette that
+  // rotates if there are more devices than entries.
+  const palette = ["#6366f1", "#10b981", "#f59e0b", "#a855f7", "#ec4899", "#06b6d4"];
+  const colorAt = (i: number) => palette[i % palette.length];
+
+  // Local string state for the inputs so users can type freely (e.g.
+  // erase to empty before typing a new number) without React clobbering
+  // the input on every keystroke. We commit to the parent on blur/Enter.
+  const [drafts, setDrafts] = useState<string[]>(() => pcts.map((p) => p.toFixed(0)));
+  // Re-sync drafts when external pcts change (e.g. "suggest" or "reset"
+  // buttons rewrite the weights). Comparing length+rounded values keeps
+  // typing stable: a draft like "5" doesn't get clobbered by 5.0.
+  const pctsKey = pcts.map((p) => Math.round(p)).join(",");
+  useEffect(() => {
+    setDrafts(pcts.map((p) => Math.round(p).toString()));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pctsKey]);
+
+  function commit(idx: number, raw: string) {
+    const parsed = parseFloat(raw);
+    if (!Number.isFinite(parsed)) {
+      setDrafts(pcts.map((p) => Math.round(p).toString()));
+      return;
+    }
+    const next = rebalance(pcts, idx, parsed);
+    onChange(next);
+  }
+
+  // SVG donut geometry. 64 viewBox units = nice round numbers in path
+  // commands; CSS sizes the chart visually.
+  const size = 128;
+  const cx = 32;
+  const cy = 32;
+  const r = 24;
+  const stroke = 10;
+
+  let acc = 0;
+  const totalPct = pcts.reduce((a, b) => a + b, 0) || 100;
+  const arcs = pcts.map((p, i) => {
+    const start = acc;
+    acc += p;
+    const end = acc;
+    return { i, start, end, p };
+  });
+
   return (
-    <label className="grid grid-cols-[1fr_auto] items-center gap-2 text-xs">
-      <div className="flex items-center justify-between gap-2 min-w-0">
-        <span className="font-mono truncate">{label}</span>
-        <span className="text-[var(--color-text-subtle)] tabular-nums shrink-0">
-          {pct === null ? "auto" : `${pct}%`}
-        </span>
+    <div className="flex items-start gap-4 flex-wrap">
+      <svg
+        viewBox="0 0 64 64"
+        width={size}
+        height={size}
+        className="shrink-0"
+        role="img"
+        aria-label="Layer-split distribution donut"
+      >
+        {arcs.map(({ i, start, end, p }) => {
+          if (p <= 0) return null;
+          // Whole circle when one device owns everything — `arc` collapses
+          // to a zero-length path otherwise.
+          if (p >= totalPct - 0.001) {
+            return (
+              <circle
+                key={i}
+                cx={cx}
+                cy={cy}
+                r={r}
+                fill="none"
+                stroke={colorAt(i)}
+                strokeWidth={stroke}
+              />
+            );
+          }
+          const a0 = (start / totalPct) * 2 * Math.PI - Math.PI / 2;
+          const a1 = (end / totalPct) * 2 * Math.PI - Math.PI / 2;
+          const x0 = cx + r * Math.cos(a0);
+          const y0 = cy + r * Math.sin(a0);
+          const x1 = cx + r * Math.cos(a1);
+          const y1 = cy + r * Math.sin(a1);
+          const large = end - start > totalPct / 2 ? 1 : 0;
+          return (
+            <path
+              key={i}
+              d={`M ${x0.toFixed(3)} ${y0.toFixed(3)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(3)} ${y1.toFixed(3)}`}
+              fill="none"
+              stroke={colorAt(i)}
+              strokeWidth={stroke}
+              strokeLinecap="butt"
+            />
+          );
+        })}
+        <text
+          x={cx}
+          y={cy + 1}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          className="fill-[var(--color-text-muted)]"
+          fontSize="6"
+          fontFamily="ui-monospace, monospace"
+        >
+          100%
+        </text>
+      </svg>
+
+      <div className="flex flex-col gap-1.5 flex-1 min-w-[220px]">
+        {labels.map((label, i) => (
+          <div
+            key={label}
+            className="grid grid-cols-[auto_1fr_auto] items-center gap-2 text-xs"
+          >
+            <span
+              aria-hidden
+              className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
+              style={{ backgroundColor: colorAt(i) }}
+            />
+            <span className="font-mono truncate">{label}</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                step={1}
+                value={drafts[i] ?? ""}
+                onChange={(e) =>
+                  setDrafts((prev) => {
+                    const next = [...prev];
+                    next[i] = e.target.value;
+                    return next;
+                  })
+                }
+                onBlur={(e) => commit(i, e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    commit(i, (e.target as HTMLInputElement).value);
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                className="w-12 text-right tabular-nums bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded px-1.5 py-0.5 text-xs focus:outline-none focus:border-[var(--color-accent)]/60"
+                aria-label={`${label} percentage`}
+              />
+              <span className="text-[var(--color-text-subtle)]">%</span>
+            </div>
+          </div>
+        ))}
       </div>
-      <input
-        type="range"
-        min={0}
-        max={1}
-        step={0.01}
-        value={value01}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="w-[200px] accent-[var(--color-accent)]"
-      />
-    </label>
+    </div>
   );
+}
+
+/// Redistribute a delta across siblings so the array still sums to 100.
+/// The edited index becomes `clamp(0, raw, 100)`; everyone else scales
+/// proportionally to their old share. When the others are all zero we
+/// split the remainder evenly (otherwise the edit would be impossible
+/// to undo without typing into every other field).
+function rebalance(prev: number[], idx: number, raw: number): number[] {
+  const clamped = Math.max(0, Math.min(100, raw));
+  if (prev.length === 1) return [100];
+  const remaining = 100 - clamped;
+  const oldOthersSum = prev.reduce((a, b, i) => (i === idx ? a : a + b), 0);
+  if (oldOthersSum <= 0) {
+    const each = remaining / (prev.length - 1);
+    return prev.map((_, i) => (i === idx ? clamped : each));
+  }
+  const scale = remaining / oldOthersSum;
+  return prev.map((p, i) => (i === idx ? clamped : p * scale));
 }
 
 /// Phase 4 chunk Q: stacked-bar visualization of model-layer distribution
