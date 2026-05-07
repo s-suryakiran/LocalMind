@@ -7,6 +7,7 @@ mod llama;
 mod models;
 mod rag;
 mod sd;
+mod slots;
 mod server;
 mod synapse;
 mod synapse_proto;
