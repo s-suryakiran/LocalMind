@@ -60,6 +60,9 @@ rcgen = "0.13"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
+# Plan 2 multi-model: cheap byte-search for routing /v1/chat/completions
+# bodies to the vision slot when image content parts are present.
+memchr = "2"
 
 [profile.release]
 lto = true

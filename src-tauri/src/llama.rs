@@ -475,6 +475,20 @@ impl LlamaState {
             .get(crate::slots::Role::Vision)
             .map(|e| (e.port, e.model_id.clone()))
     }
+
+    /// Pick the port a /v1/chat/completions request should be proxied to,
+    /// based on whether the body has any image_url content parts. Vision
+    /// slot wins for image-bearing requests when loaded; otherwise chat.
+    /// Returns `None` if neither slot can serve.
+    pub async fn route_chat_port(&self, has_image: bool) -> Option<u16> {
+        let table = self.table.lock().await;
+        if has_image {
+            if let Some(e) = table.get(crate::slots::Role::Vision) {
+                return Some(e.port);
+            }
+        }
+        table.get(crate::slots::Role::Chat).map(|e| e.port)
+    }
 }
 
 /// Pre-flight check: would loading `new_role` with the given file size
