@@ -55,7 +55,10 @@ export function runReachabilityPoller(opts: PollerOptions): () => void {
     timer = setTimeout(tick, opts.intervalMs());
   };
 
-  timer = setTimeout(tick, opts.intervalMs());
+  // Fire the first probe immediately so a cold-start (especially the
+  // PWA from a phone home-screen icon) can flip the online slice
+  // without waiting `intervalMs()` of dead time.
+  timer = setTimeout(tick, 0);
 
   return () => {
     stopped = true;
