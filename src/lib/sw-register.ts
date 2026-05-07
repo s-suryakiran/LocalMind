@@ -5,6 +5,7 @@
  * giving us a chance to ask the user before swapping the bundle.
  */
 import { registerSW } from "virtual:pwa-register";
+import { isTauri } from "./util";
 
 let updateFn: ((reload?: boolean) => Promise<void>) | null = null;
 const updateListeners = new Set<() => void>();
@@ -12,7 +13,7 @@ const updateListeners = new Set<() => void>();
 export function initServiceWorker() {
   // No-op in Tauri (the desktop app doesn't run as a PWA in the same
   // sense — webview owns the lifecycle). Avoid double-installing.
-  if ((window as any).__TAURI_INTERNALS__) return;
+  if (isTauri()) return;
 
   updateFn = registerSW({
     onNeedRefresh() {
