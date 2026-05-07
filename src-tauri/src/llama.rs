@@ -358,6 +358,102 @@ impl LlamaState {
 
         Ok(self.status().await)
     }
+
+    /// Start a dedicated vision slot. Independent of the chat slot:
+    /// a user can have a 7B chat model + a 7B LLaVA loaded at the same
+    /// time, and image-bearing chat requests get routed to this slot.
+    /// Synapse pipelining is intentionally NOT applied — vision is
+    /// local-only.
+    pub async fn start_vision(
+        &self,
+        app: &AppHandle,
+        model_id: String,
+        mmproj_id: String,
+    ) -> Result<LlamaStatus> {
+        // Stop any existing vision slot first — we only support one at a time.
+        if let Some(mut prev) = self
+            .table
+            .lock()
+            .await
+            .remove(crate::slots::Role::Vision)
+        {
+            let _ = prev.child.kill().await;
+        }
+
+        let preferred = crate::slots::Role::Vision.default_port();
+        kill_orphan_on_port(preferred).await;
+        let pool = crate::slots::port_pool(crate::slots::Role::Vision);
+        let port = crate::slots::pick_port(preferred, &pool, crate::slots::port_is_free)
+            .ok_or_else(|| anyhow!("no free port in vision pool {pool:?}"))?;
+
+        let binary = binaries::ensure_llama_server(app).await?;
+        let model = models::model_path(&model_id)?;
+        let mmproj_path = models::model_path(&mmproj_id)?;
+        let hw = hardware::detect();
+        let threads = (hw.cpu_cores as u32).saturating_sub(1).max(1);
+        let n_gpu = hw.recommended_n_gpu_layers;
+
+        let mut cmd = Command::new(&binary);
+        cmd.arg("-m").arg(&model);
+        cmd.arg("--mmproj").arg(&mmproj_path);
+        cmd.arg("--host").arg("127.0.0.1");
+        cmd.arg("--port").arg(port.to_string());
+        cmd.arg("-t").arg(threads.to_string());
+        cmd.arg("-ngl").arg(n_gpu.to_string());
+        cmd.arg("--jinja");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("failed to spawn vision llama-server: {e}"))?;
+        pipe_output(app, &mut child, "vision");
+
+        {
+            let mut table = self.table.lock().await;
+            table.insert(
+                crate::slots::Role::Vision,
+                crate::slots::SlotEntry {
+                    child,
+                    port,
+                    model_id: model_id.clone(),
+                    mmproj_id: Some(mmproj_id.clone()),
+                },
+            );
+        }
+
+        wait_ready(port).await?;
+
+        let _ = app.emit(
+            "llama:ready",
+            serde_json::json!({ "port": port, "modelId": model_id, "stream": "vision" }),
+        );
+
+        Ok(self.status().await)
+    }
+
+    pub async fn stop_vision(&self) -> Result<()> {
+        if let Some(mut entry) = self
+            .table
+            .lock()
+            .await
+            .remove(crate::slots::Role::Vision)
+        {
+            let _ = entry.child.kill().await;
+        }
+        Ok(())
+    }
+
+    /// Read-only snapshot of the vision slot's port + model. None when
+    /// vision isn't loaded. Used by `server.rs::proxy_v1` to route
+    /// image-bearing requests.
+    pub async fn vision_slot(&self) -> Option<(u16, String)> {
+        self.table
+            .lock()
+            .await
+            .get(crate::slots::Role::Vision)
+            .map(|e| (e.port, e.model_id.clone()))
+    }
 }
 
 fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
