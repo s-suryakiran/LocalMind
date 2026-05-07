@@ -27,3 +27,41 @@ export function isOnline(s: OnlineSignal, now: number): boolean {
   if (s.lastOk == null) return false;
   return now - s.lastOk <= OFFLINE_AFTER_MS;
 }
+
+export interface PollerOptions {
+  /** Async probe — should resolve when reachable, throw or return falsy `ok` when not. */
+  probe: () => Promise<{ ok: boolean } | Response>;
+  /** Returns the next delay in ms. Lets the caller back off when offline. */
+  intervalMs: () => number;
+  onSuccess: () => void;
+  onFailure: (err: unknown) => void;
+}
+
+export function runReachabilityPoller(opts: PollerOptions): () => void {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const res = await opts.probe();
+      if (stopped) return;
+      if ((res as { ok: boolean }).ok) opts.onSuccess();
+      else opts.onFailure(new Error(`probe responded not ok`));
+    } catch (e) {
+      if (!stopped) opts.onFailure(e);
+    }
+    if (stopped) return;
+    timer = setTimeout(tick, opts.intervalMs());
+  };
+
+  timer = setTimeout(tick, opts.intervalMs());
+
+  return () => {
+    stopped = true;
+    if (timer != null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+}
