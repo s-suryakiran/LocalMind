@@ -70,86 +70,91 @@ pub struct LlamaStatus {
     pub embedding_model_id: Option<String>,
 }
 
-struct ServerHandle {
-    child: Option<Child>,
-    port: u16,
-    model_id: Option<String>,
-    mmproj_id: Option<String>,
-}
-
-impl ServerHandle {
-    fn new(default_port: u16) -> Self {
-        Self {
-            child: None,
-            port: default_port,
-            model_id: None,
-            mmproj_id: None,
-        }
-    }
-}
-
 pub struct LlamaState {
-    chat: Mutex<ServerHandle>,
-    embed: Mutex<ServerHandle>,
-    /// Phase 3: per-worker local proxies that authenticate with each remote
-    /// worker before bytes flow. Lifecycle is tied to the chat server: spun
-    /// up in `start`, torn down in `stop`. Owned here (rather than in
-    /// SynapseState) because that's where the lifecycle invariant lives.
+    /// One mutex over the whole table — all slot transitions go through
+    /// it. Slots are short-running operations (spawn child, wait_ready);
+    /// the mutex isn't held while llama-server is generating.
+    table: Mutex<crate::slots::SlotTable>,
+    /// Phase 3: per-worker local proxies that authenticate with each
+    /// remote worker before bytes flow. Lifecycle is tied to the **chat**
+    /// slot specifically — pipeline-sharded inference only makes sense
+    /// for the chat model. Embed and vision stay local-only.
     host_proxy: Arc<HostProxy>,
 }
 
 impl LlamaState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            chat: Mutex::new(ServerHandle::new(8181)),
-            embed: Mutex::new(ServerHandle::new(8182)),
+            table: Mutex::new(crate::slots::SlotTable::new()),
             host_proxy: HostProxy::new(),
         })
     }
 
     pub async fn status(&self) -> LlamaStatus {
-        let chat = self.chat.lock().await;
-        let embed = self.embed.lock().await;
+        let table = self.table.lock().await;
+        let chat = table.get(crate::slots::Role::Chat);
+        let embed = table.get(crate::slots::Role::Embed);
+
+        // Legacy flat fields stay populated for one release so the
+        // existing frontend keeps working unmodified. Task 8 evolves
+        // the type to add the new `slots` array.
         LlamaStatus {
-            running: chat.child.is_some(),
-            port: chat.port,
-            model_id: chat.model_id.clone(),
-            mmproj_id: chat.mmproj_id.clone(),
-            pid: chat.child.as_ref().and_then(|c| c.id()),
-            embedding_running: embed.child.is_some(),
-            embedding_port: embed.port,
-            embedding_model_id: embed.model_id.clone(),
+            running: chat.is_some(),
+            port: chat
+                .map(|e| e.port)
+                .unwrap_or_else(|| crate::slots::Role::Chat.default_port()),
+            model_id: chat.map(|e| e.model_id.clone()),
+            mmproj_id: chat.and_then(|e| e.mmproj_id.clone()),
+            pid: chat.and_then(|e| e.child.id()),
+            embedding_running: embed.is_some(),
+            embedding_port: embed
+                .map(|e| e.port)
+                .unwrap_or_else(|| crate::slots::Role::Embed.default_port()),
+            embedding_model_id: embed.map(|e| e.model_id.clone()),
         }
     }
 
     pub async fn embedding_port(&self) -> u16 {
-        self.embed.lock().await.port
+        self.table
+            .lock()
+            .await
+            .get(crate::slots::Role::Embed)
+            .map(|e| e.port)
+            .unwrap_or_else(|| crate::slots::Role::Embed.default_port())
     }
 
     pub async fn embedding_running(&self) -> bool {
-        self.embed.lock().await.child.is_some()
+        self.table
+            .lock()
+            .await
+            .get(crate::slots::Role::Embed)
+            .is_some()
     }
 
     pub async fn stop(&self) -> Result<()> {
-        let mut chat = self.chat.lock().await;
-        if let Some(mut c) = chat.child.take() {
-            let _ = c.kill().await;
+        if let Some(mut entry) = self
+            .table
+            .lock()
+            .await
+            .remove(crate::slots::Role::Chat)
+        {
+            let _ = entry.child.kill().await;
         }
-        chat.model_id = None;
-        chat.mmproj_id = None;
-        // Phase 3: also free the local proxy ports + tasks. Done here (not in
-        // a separate command) so that "stop model" always means "stop
-        // everything model-related" — no leaked listeners.
+        // Synapse host proxies are tied to the chat slot's lifecycle —
+        // tear them down whenever chat goes away. Phase 3 invariant.
         self.host_proxy.stop_all().await;
         Ok(())
     }
 
     pub async fn stop_embedding(&self) -> Result<()> {
-        let mut embed = self.embed.lock().await;
-        if let Some(mut c) = embed.child.take() {
-            let _ = c.kill().await;
+        if let Some(mut entry) = self
+            .table
+            .lock()
+            .await
+            .remove(crate::slots::Role::Embed)
+        {
+            let _ = entry.child.kill().await;
         }
-        embed.model_id = None;
         Ok(())
     }
 
@@ -276,11 +281,20 @@ impl LlamaState {
         pipe_output(app, &mut child, "chat");
 
         {
-            let mut chat = self.chat.lock().await;
-            chat.child = Some(child);
-            chat.port = port;
-            chat.model_id = Some(settings.model_id.clone());
-            chat.mmproj_id = loaded_mmproj;
+            let mut table = self.table.lock().await;
+            // Insert atomically — if a previous chat slot existed (it shouldn't
+            // after the `self.stop().await?` at the top, but defensively):
+            if let Some(mut prev) = table.insert(
+                crate::slots::Role::Chat,
+                crate::slots::SlotEntry {
+                    child,
+                    port,
+                    model_id: settings.model_id.clone(),
+                    mmproj_id: loaded_mmproj.clone(),
+                },
+            ) {
+                let _ = prev.child.kill().await;
+            }
         }
 
         wait_ready(port).await?;
@@ -321,10 +335,18 @@ impl LlamaState {
         pipe_output(app, &mut child, "embed");
 
         {
-            let mut embed = self.embed.lock().await;
-            embed.child = Some(child);
-            embed.port = port;
-            embed.model_id = Some(model_id.clone());
+            let mut table = self.table.lock().await;
+            if let Some(mut prev) = table.insert(
+                crate::slots::Role::Embed,
+                crate::slots::SlotEntry {
+                    child,
+                    port,
+                    model_id: model_id.clone(),
+                    mmproj_id: None,
+                },
+            ) {
+                let _ = prev.child.kill().await;
+            }
         }
 
         wait_ready(port).await?;
