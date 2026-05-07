@@ -130,6 +130,43 @@ pub fn port_pool(role: Role) -> Vec<u16> {
     }
 }
 
+use crate::hardware::{Accelerator, HardwareInfo};
+
+/// VRAM (or unified memory) available for inference, in GB. Returns
+/// None for CPU-only systems (no hard upper bound — caller falls back
+/// to RAM check). Apple Silicon reserves 30% for the OS and Metal
+/// surfaces; on dedicated GPUs we use the full reported VRAM since the
+/// OS lives in system RAM.
+pub fn available_gpu_memory_gb(hw: &HardwareInfo) -> Option<f64> {
+    match &hw.accelerator {
+        Accelerator::AppleSilicon { unified_memory_gb, .. } => Some(unified_memory_gb * 0.7),
+        Accelerator::Nvidia { vram_gb, .. } => Some(*vram_gb),
+        Accelerator::Amd { vram_gb, .. } => Some(*vram_gb),
+        Accelerator::IntelArc { .. } | Accelerator::Cpu => None,
+    }
+}
+
+/// Rough per-slot VRAM estimate. A fully-offloaded GGUF takes
+/// approximately its file size in VRAM at load time, plus ~0.5 GB
+/// for KV cache + activation overhead at the default 4k context.
+/// Conservative — we'd rather refuse a load that would have just
+/// barely fit than OOM mid-inference.
+pub fn estimate_slot_vram_gb(file_size_bytes: u64) -> f64 {
+    (file_size_bytes as f64 / 1024.0 / 1024.0 / 1024.0) + 0.5
+}
+
+/// Would loading a new model with `new_size_bytes` push total estimated
+/// VRAM use past `available_gb`?
+pub fn fits_with_existing(
+    existing_sizes: &[u64],
+    new_size_bytes: u64,
+    available_gb: f64,
+) -> bool {
+    let used: f64 = existing_sizes.iter().map(|&b| estimate_slot_vram_gb(b)).sum();
+    let needed = estimate_slot_vram_gb(new_size_bytes);
+    used + needed <= available_gb
+}
+
 /// One slot's externally-visible state. Returned to the frontend as
 /// part of `LlamaStatus.slots`.
 #[derive(Debug, Clone, Serialize)]
@@ -261,5 +298,62 @@ mod tests {
         let probe = |_: u16| false;
         let port = pick_port(8181, &[8181, 8182, 8183], probe);
         assert_eq!(port, None);
+    }
+
+    fn hw(accel: Accelerator) -> HardwareInfo {
+        HardwareInfo {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            cpu_name: "test".into(),
+            cpu_cores: 8,
+            total_memory_gb: 16.0,
+            accelerator: accel,
+            recommended_backend: "metal".into(),
+            recommended_n_gpu_layers: -1,
+        }
+    }
+
+    #[test]
+    fn available_gpu_memory_apple_silicon_reserves_30pct() {
+        let info = hw(Accelerator::AppleSilicon { chip: "M1 Pro".into(), unified_memory_gb: 16.0 });
+        let avail = available_gpu_memory_gb(&info).unwrap();
+        // 70% of 16 = 11.2; allow small float wiggle.
+        assert!((avail - 11.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn available_gpu_memory_nvidia_uses_full_vram() {
+        let info = hw(Accelerator::Nvidia { name: "4090".into(), vram_gb: 24.0, cuda_version: None });
+        assert_eq!(available_gpu_memory_gb(&info), Some(24.0));
+    }
+
+    #[test]
+    fn available_gpu_memory_cpu_returns_none() {
+        let info = hw(Accelerator::Cpu);
+        assert_eq!(available_gpu_memory_gb(&info), None);
+    }
+
+    #[test]
+    fn slot_vram_estimate_adds_kv_overhead() {
+        // 4 GB file → ~4.5 GB estimate (file + 0.5 GB for KV cache).
+        let bytes = 4 * 1024 * 1024 * 1024_u64;
+        let est = estimate_slot_vram_gb(bytes);
+        assert!((est - 4.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn fits_with_existing_passes_when_under_budget() {
+        // 4 GB existing + 2 GB new = ~7 GB used (incl. overhead) within 16 GB.
+        let existing = vec![4 * 1024 * 1024 * 1024_u64];
+        let new_model = 2 * 1024 * 1024 * 1024_u64;
+        assert!(fits_with_existing(&existing, new_model, 16.0));
+    }
+
+    #[test]
+    fn fits_with_existing_fails_when_over_budget() {
+        // 10 GB + 8 GB ≈ 19 GB > 16 GB available.
+        let existing = vec![10 * 1024 * 1024 * 1024_u64];
+        let new_model = 8 * 1024 * 1024 * 1024_u64;
+        assert!(!fits_with_existing(&existing, new_model, 16.0));
     }
 }
