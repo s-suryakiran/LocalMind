@@ -310,6 +310,50 @@ fn synapse_active_sessions() -> u32 {
     auth_proxy::ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[tauri::command]
+async fn start_slot(
+    app: AppHandle,
+    state: State<'_, Arc<AppStateHolder>>,
+    role: slots::Role,
+    model_id: String,
+    mmproj_id: Option<String>,
+) -> Result<LlamaStatus, String> {
+    let result = match role {
+        slots::Role::Chat => {
+            // Use the existing rich path — Synapse workers, host weight,
+            // mmproj as a chat-attached model — by constructing a minimal
+            // LlamaSettings. Callers that need flags (context, etc.)
+            // should still use the legacy start_llama command.
+            let settings = LlamaSettings {
+                model_id,
+                mmproj_id,
+                ..Default::default()
+            };
+            state.llama.start(&app, settings).await
+        }
+        slots::Role::Embed => state.llama.start_embedding(&app, model_id).await,
+        slots::Role::Vision => {
+            let mmproj = mmproj_id
+                .ok_or_else(|| anyhow::anyhow!("vision slot requires an mmproj_id"))?;
+            state.llama.start_vision(&app, model_id, mmproj).await
+        }
+    };
+    result.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_slot(
+    state: State<'_, Arc<AppStateHolder>>,
+    role: slots::Role,
+) -> Result<(), String> {
+    let result = match role {
+        slots::Role::Chat => state.llama.stop().await,
+        slots::Role::Embed => state.llama.stop_embedding().await,
+        slots::Role::Vision => state.llama.stop_vision().await,
+    };
+    result.map_err(|e| e.to_string())
+}
+
 fn generate_pin() -> String {
     let raw = uuid::Uuid::new_v4().as_u128();
     format!("{:06}", (raw % 1_000_000) as u32)
@@ -420,6 +464,8 @@ pub fn run() {
             rotate_synapse_token,
             set_known_synapse_tokens,
             synapse_active_sessions,
+            start_slot,
+            stop_slot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -149,6 +149,10 @@ export const api = {
   setKnownSynapseTokens: (tokens: Record<string, string>) =>
     invoke<void>("set_known_synapse_tokens", { tokens }),
   synapseActiveSessions: () => invoke<number>("synapse_active_sessions"),
+  startSlot: (role: import("./types").Role, modelId: string, mmprojId?: string) =>
+    invoke<LlamaStatus>("start_slot", { role, modelId, mmprojId }),
+  stopSlot: (role: import("./types").Role) =>
+    invoke<void>("stop_slot", { role }),
 };
 
 export type ChatContentPart =
