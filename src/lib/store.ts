@@ -59,6 +59,13 @@ interface AppState {
   lanUrl: string | null;
   setLanUrl: (u: string | null) => void;
 
+  // PWA offline shell. `online` is what UI components read; `lastOnlineAt`
+  // is the timestamp the reachability poller last got a 200 from
+  // /api/health. We don't persist these — both reset to defaults on boot.
+  online: boolean;
+  lastOnlineAt: number | null;
+  setOnline: (online: boolean, at: number | null) => void;
+
   conversations: Conversation[];
   activeConvId: string | null;
   createConversation: (modelId: string | null) => string;
@@ -146,6 +153,10 @@ export const useApp = create<AppState>()(
 
       lanUrl: null,
       setLanUrl: (u) => set({ lanUrl: u }),
+
+      online: typeof navigator !== "undefined" ? navigator.onLine : true,
+      lastOnlineAt: null,
+      setOnline: (online, at) => set({ online, lastOnlineAt: at }),
 
       conversations: [],
       activeConvId: null,

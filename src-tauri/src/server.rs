@@ -375,3 +375,39 @@ async fn prometheus_metrics(State(s): State<AppState>) -> impl IntoResponse {
         out,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_public_path;
+
+    #[test]
+    fn sw_js_is_public() {
+        assert!(is_public_path("/sw.js"));
+    }
+
+    #[test]
+    fn register_sw_js_is_public() {
+        assert!(is_public_path("/registerSW.js"));
+    }
+
+    #[test]
+    fn workbox_chunks_are_public() {
+        // workbox-window emits hashed chunks like /workbox-abc123.js
+        assert!(is_public_path("/workbox-fa3b7a48.js"));
+    }
+
+    #[test]
+    fn manifest_is_public() {
+        assert!(is_public_path("/manifest.webmanifest"));
+    }
+
+    #[test]
+    fn api_status_still_requires_auth() {
+        assert!(!is_public_path("/api/status"));
+    }
+
+    #[test]
+    fn v1_chat_still_requires_auth() {
+        assert!(!is_public_path("/v1/chat/completions"));
+    }
+}

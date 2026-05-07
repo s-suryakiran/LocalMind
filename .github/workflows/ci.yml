@@ -63,6 +63,15 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # tauri-build validates that every path in tauri.conf.json's
+      # bundle.resources actually exists. We bundle ../dist as a resource
+      # so the LAN server can serve the prod React app, but on this lint
+      # job we never run `npm run build` — so stub an empty placeholder
+      # here. Clippy doesn't need real bundle contents; only the
+      # existence check needs to pass.
+      - name: Stub empty dist/ for tauri-build resource validation
+        run: mkdir -p dist
+
       - name: cargo fmt
         working-directory: src-tauri
         run: cargo fmt --all -- --check
