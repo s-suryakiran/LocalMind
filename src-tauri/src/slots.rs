@@ -36,6 +36,73 @@ impl Role {
     }
 }
 
+/// Internal handle for a running llama-server child. Held inside the
+/// SlotTable; not exposed across the module boundary because callers
+/// have no business poking at the `Child` directly.
+pub struct SlotEntry {
+    pub child: tokio::process::Child,
+    pub port: u16,
+    pub model_id: String,
+    pub mmproj_id: Option<String>,
+}
+
+/// Map keyed by Role. We don't use a HashMap — there are exactly three
+/// roles and a fixed-size array is faster, simpler, and self-documents.
+#[derive(Default)]
+pub struct SlotTable {
+    chat: Option<SlotEntry>,
+    embed: Option<SlotEntry>,
+    vision: Option<SlotEntry>,
+}
+
+impl SlotTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, role: Role) -> Option<&SlotEntry> {
+        match role {
+            Role::Chat => self.chat.as_ref(),
+            Role::Embed => self.embed.as_ref(),
+            Role::Vision => self.vision.as_ref(),
+        }
+    }
+
+    pub fn insert(&mut self, role: Role, entry: SlotEntry) -> Option<SlotEntry> {
+        let slot = match role {
+            Role::Chat => &mut self.chat,
+            Role::Embed => &mut self.embed,
+            Role::Vision => &mut self.vision,
+        };
+        slot.replace(entry)
+    }
+
+    pub fn remove(&mut self, role: Role) -> Option<SlotEntry> {
+        match role {
+            Role::Chat => self.chat.take(),
+            Role::Embed => self.embed.take(),
+            Role::Vision => self.vision.take(),
+        }
+    }
+
+    pub fn statuses(&self) -> Vec<SlotStatus> {
+        [Role::Chat, Role::Embed, Role::Vision]
+            .iter()
+            .map(|&r| {
+                let entry = self.get(r);
+                SlotStatus {
+                    role: r,
+                    running: entry.is_some(),
+                    port: entry.map(|e| e.port).unwrap_or_else(|| r.default_port()),
+                    model_id: entry.map(|e| e.model_id.clone()),
+                    mmproj_id: entry.and_then(|e| e.mmproj_id.clone()),
+                    pid: entry.and_then(|e| e.child.id()),
+                }
+            })
+            .collect()
+    }
+}
+
 /// One slot's externally-visible state. Returned to the frontend as
 /// part of `LlamaStatus.slots`.
 #[derive(Debug, Clone, Serialize)]
@@ -73,5 +140,78 @@ mod tests {
         assert_eq!(Role::Chat.as_str(), "chat");
         assert_eq!(Role::Embed.as_str(), "embed");
         assert_eq!(Role::Vision.as_str(), "vision");
+    }
+
+    use std::process::Stdio;
+
+    fn dummy_child() -> tokio::process::Child {
+        // Spawn `true` (Unix) or `cmd /c` (Windows) — we just need a Child
+        // we can hold and drop without it actually doing anything.
+        #[cfg(target_family = "unix")]
+        {
+            tokio::process::Command::new("true").stdout(Stdio::null()).spawn().unwrap()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            tokio::process::Command::new("cmd").args(["/c", "exit"]).stdout(Stdio::null()).spawn().unwrap()
+        }
+    }
+
+    fn dummy_entry(port: u16, model_id: &str) -> SlotEntry {
+        SlotEntry {
+            child: dummy_child(),
+            port,
+            model_id: model_id.to_string(),
+            mmproj_id: None,
+        }
+    }
+
+    #[test]
+    fn empty_table_has_no_running_slots() {
+        let t = SlotTable::new();
+        let statuses = t.statuses();
+        assert_eq!(statuses.len(), 3);
+        assert!(statuses.iter().all(|s| !s.running));
+    }
+
+    // The remaining tests need a tokio runtime because they spawn
+    // child processes via `tokio::process::Command` (so SlotEntry can
+    // hold a real `tokio::process::Child`).
+
+    #[tokio::test]
+    async fn insert_then_get_returns_entry() {
+        let mut t = SlotTable::new();
+        t.insert(Role::Chat, dummy_entry(8181, "chat-7b"));
+        assert!(t.get(Role::Chat).is_some());
+        assert!(t.get(Role::Embed).is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_returns_previous_entry() {
+        let mut t = SlotTable::new();
+        t.insert(Role::Chat, dummy_entry(8181, "chat-7b"));
+        let prev = t.insert(Role::Chat, dummy_entry(8181, "chat-13b"));
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().model_id, "chat-7b");
+        assert_eq!(t.get(Role::Chat).unwrap().model_id, "chat-13b");
+    }
+
+    #[tokio::test]
+    async fn remove_takes_entry_out() {
+        let mut t = SlotTable::new();
+        t.insert(Role::Vision, dummy_entry(8183, "llava"));
+        let taken = t.remove(Role::Vision);
+        assert!(taken.is_some());
+        assert!(t.get(Role::Vision).is_none());
+    }
+
+    #[tokio::test]
+    async fn statuses_reflects_loaded_slots() {
+        let mut t = SlotTable::new();
+        t.insert(Role::Embed, dummy_entry(8182, "nomic-embed"));
+        let statuses = t.statuses();
+        let embed = statuses.iter().find(|s| s.role == Role::Embed).unwrap();
+        assert!(embed.running);
+        assert_eq!(embed.model_id.as_deref(), Some("nomic-embed"));
     }
 }
