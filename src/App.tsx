@@ -82,11 +82,20 @@ function App() {
       };
     }
     if (connection) {
-      remoteStatus().then(setLlama).catch(() => {});
-      const t = setInterval(() => remoteStatus().then(setLlama).catch(() => {}), 5000);
+      // The /api/status poll doubles as the reachability signal — when
+      // it succeeds we're online, when it fails the host is unreachable.
+      // This runs alongside the dedicated /health poller; either one
+      // updating `online` is enough to surface the banner.
+      const ok = (s: Parameters<typeof setLlama>[0]) => {
+        setLlama(s);
+        setOnline(true, Date.now());
+      };
+      const fail = () => setOnline(false, useApp.getState().lastOnlineAt);
+      remoteStatus().then(ok).catch(fail);
+      const t = setInterval(() => remoteStatus().then(ok).catch(fail), 5000);
       return () => clearInterval(t);
     }
-  }, [remote, connection, setHardware, setInstalled, setLanUrl, setLlama]);
+  }, [remote, connection, setHardware, setInstalled, setLanUrl, setLlama, setOnline]);
 
   if (remote && !connection) {
     return <Connect />;
