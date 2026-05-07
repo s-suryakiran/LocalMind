@@ -47,12 +47,21 @@ export async function probeServer(url: string): Promise<boolean> {
   }
 }
 
+/** Sentinel error class so callers can branch on "stale token, re-pair" vs. transient network failure. */
+export class UnauthorizedError extends Error {
+  constructor() {
+    super("unauthorized");
+    this.name = "UnauthorizedError";
+  }
+}
+
 export async function remoteStatus(): Promise<LlamaStatus> {
   const c = connection();
   if (!c) throw new Error("not connected");
   const res = await fetch(`${c.url.replace(/\/+$/, "")}/api/status`, {
     headers: authHeaders(),
   });
+  if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error(`status failed: ${res.status}`);
   return res.json();
 }

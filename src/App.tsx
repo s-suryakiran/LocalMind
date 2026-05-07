@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, listen, remoteStatus } from "./lib/api";
+import { api, listen, remoteStatus, UnauthorizedError } from "./lib/api";
 import { useApp } from "./lib/store";
 import { isTauri } from "./lib/util";
 import {
@@ -20,7 +20,7 @@ import { Settings } from "./pages/Settings";
 import { Connect } from "./pages/Connect";
 
 function App() {
-  const { view, setHardware, setInstalled, setLanUrl, setLlama, connection, setOnline } = useApp();
+  const { view, setHardware, setInstalled, setLanUrl, setLlama, connection, setOnline, setConnection } = useApp();
   const remote = !isTauri();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -95,12 +95,21 @@ function App() {
         setLlama(s);
         setOnline(true, Date.now());
       };
-      const fail = () => setOnline(false, useApp.getState().lastOnlineAt);
+      const fail = (e: unknown) => {
+        if (e instanceof UnauthorizedError) {
+          // Stale token — desktop restarted, our pin/token are
+          // dead. Drop the connection so the Connect screen takes
+          // over instead of perpetually banner-flashing.
+          setConnection(null);
+          return;
+        }
+        setOnline(false, useApp.getState().lastOnlineAt);
+      };
       remoteStatus().then(ok).catch(fail);
       const t = setInterval(() => remoteStatus().then(ok).catch(fail), 5000);
       return () => clearInterval(t);
     }
-  }, [remote, connection, setHardware, setInstalled, setLanUrl, setLlama, setOnline]);
+  }, [remote, connection, setHardware, setInstalled, setLanUrl, setLlama, setOnline, setConnection]);
 
   if (remote && !connection) {
     return <Connect />;
