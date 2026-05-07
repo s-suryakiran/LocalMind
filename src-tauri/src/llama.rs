@@ -60,6 +60,9 @@ pub struct LlamaSettings {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlamaStatus {
+    /// Legacy flat fields — derived from `slots`. Kept populated for
+    /// one release so the frontend can migrate incrementally. New code
+    /// should read `slots` directly.
     pub running: bool,
     pub port: u16,
     pub model_id: Option<String>,
@@ -68,6 +71,9 @@ pub struct LlamaStatus {
     pub embedding_running: bool,
     pub embedding_port: u16,
     pub embedding_model_id: Option<String>,
+    /// Canonical: one entry per role (always exactly 3, in the order
+    /// chat / embed / vision). `running == false` for unloaded roles.
+    pub slots: Vec<crate::slots::SlotStatus>,
 }
 
 pub struct LlamaState {
@@ -94,10 +100,7 @@ impl LlamaState {
         let table = self.table.lock().await;
         let chat = table.get(crate::slots::Role::Chat);
         let embed = table.get(crate::slots::Role::Embed);
-
-        // Legacy flat fields stay populated for one release so the
-        // existing frontend keeps working unmodified. Task 8 evolves
-        // the type to add the new `slots` array.
+        let slots = table.statuses();
         LlamaStatus {
             running: chat.is_some(),
             port: chat
@@ -111,6 +114,7 @@ impl LlamaState {
                 .map(|e| e.port)
                 .unwrap_or_else(|| crate::slots::Role::Embed.default_port()),
             embedding_model_id: embed.map(|e| e.model_id.clone()),
+            slots,
         }
     }
 

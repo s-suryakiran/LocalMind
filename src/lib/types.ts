@@ -48,6 +48,17 @@ export interface InstalledModel {
   kind: ModelKind;
 }
 
+export type Role = "chat" | "embed" | "vision";
+
+export interface SlotStatus {
+  role: Role;
+  running: boolean;
+  port: number;
+  modelId: string | null;
+  mmprojId: string | null;
+  pid: number | null;
+}
+
 export interface LlamaStatus {
   running: boolean;
   port: number;
@@ -57,6 +68,8 @@ export interface LlamaStatus {
   embeddingRunning: boolean;
   embeddingPort: number;
   embeddingModelId: string | null;
+  /** Canonical per-role view. Always exactly 3 entries: chat / embed / vision. */
+  slots: SlotStatus[];
 }
 
 /** A single Synapse worker the host wants to pipeline-shard layers onto.
