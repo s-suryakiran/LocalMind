@@ -36,6 +36,13 @@ export default defineConfig(async () => ({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,webmanifest}"],
+        // Take control of clients on first install — without these, the
+        // initial SW sits in "waiting" until the next navigation, so an
+        // iOS home-screen cold-start (which IS the next navigation) hits
+        // the network instead of the cached shell, and shows "can't
+        // connect to host" if the desktop is offline.
+        skipWaiting: true,
+        clientsClaim: true,
         navigateFallback: "/index.html",
         navigateFallbackDenylist: [/^\/api\//, /^\/v1\//, /^\/sd-images\//, /^\/health$/],
         runtimeCaching: [
