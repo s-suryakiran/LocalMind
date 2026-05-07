@@ -334,7 +334,7 @@ async fn start_slot(
         slots::Role::Embed => state.llama.start_embedding(&app, model_id).await,
         slots::Role::Vision => {
             let mmproj = mmproj_id
-                .ok_or_else(|| anyhow::anyhow!("vision slot requires an mmproj_id"))?;
+                .ok_or_else(|| "vision slot requires an mmproj_id".to_string())?;
             state.llama.start_vision(&app, model_id, mmproj).await
         }
     };
