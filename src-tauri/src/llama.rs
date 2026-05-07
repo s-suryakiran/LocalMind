@@ -472,8 +472,10 @@ impl LlamaState {
     }
 
     /// Read-only snapshot of the vision slot's port + model. None when
-    /// vision isn't loaded. Used by `server.rs::proxy_v1` to route
-    /// image-bearing requests.
+    /// vision isn't loaded. Currently unused — `route_chat_port` does
+    /// the routing inline — but kept for callers that want explicit
+    /// per-slot lookups (e.g. a future Synapse panel UI).
+    #[allow(dead_code)]
     pub async fn vision_slot(&self) -> Option<(u16, String)> {
         self.table
             .lock()

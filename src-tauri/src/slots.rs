@@ -27,6 +27,10 @@ impl Role {
         }
     }
 
+    /// Stable string form for logs and Tauri-event payloads. Currently
+    /// only exercised in tests; intentionally part of the public API
+    /// because subsequent plans wire it into Tauri events.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Chat => "chat",
