@@ -282,12 +282,12 @@ Shipped:
 - [x] Synapse v1 — manual LAN pipeline-shard via llama.cpp RPC
 - [x] Synapse v2 — auto-discovery (mDNS + UDP beacon), dedicated UI, GPU runtime auto-fetch on Windows
 - [x] Synapse v3 — token-gated auth proxy, HMAC-signed beacons, live tok/s + RTT, manual layer split, marketplace size hints
+- [x] Synapse v4 — TLS on the proxy channel, mid-inference reconnect, auto-tuned layer split, multi-host workers
+- [x] Service-worker offline shell for the PWA
 
 Next:
-- [ ] Service-worker-backed offline shell for the PWA
 - [ ] Tauri Mobile (iOS/Android) reaching parity with the PWA
 - [ ] Multi-model concurrent serving (chat + embed + vision in one session)
-- [ ] Synapse v4 — TLS on the proxy channel, mid-inference reconnect, auto-tuned layer split, multi-host workers
 - [ ] Speaker diarization for voice
 - [ ] Plugin system for custom tools
 
