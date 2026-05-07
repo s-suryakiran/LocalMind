@@ -41,7 +41,12 @@ function App() {
     const base = connection.url.replace(/\/+$/, "");
     let currentOnline = useApp.getState().online;
     const stop = runReachabilityPoller({
-      probe: () => fetch(`${base}/health`, { method: "GET", cache: "no-store" }),
+      // /api/health is auth-public and ALWAYS returns 200 when the LAN
+      // server is reachable, regardless of whether a model is loaded.
+      // Don't use /health here — it proxies to llama-server and fails
+      // any time no model is running, which would falsely flip the
+      // banner on while the desktop is perfectly fine.
+      probe: () => fetch(`${base}/api/health`, { method: "GET", cache: "no-store" }),
       intervalMs: () => (currentOnline ? ONLINE_POLL_MS : OFFLINE_POLL_MS),
       onSuccess: () => {
         currentOnline = true;
