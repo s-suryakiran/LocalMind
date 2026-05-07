@@ -160,6 +160,12 @@ impl LlamaState {
 
     pub async fn start(&self, app: &AppHandle, settings: LlamaSettings) -> Result<LlamaStatus> {
         self.stop().await?;
+
+        let model_size = std::fs::metadata(models::model_path(&settings.model_id)?)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        preflight_vram(self, crate::slots::Role::Chat, model_size).await?;
+
         let port = settings.port.unwrap_or(8181);
         kill_orphan_on_port(port).await;
 
@@ -309,6 +315,12 @@ impl LlamaState {
 
     pub async fn start_embedding(&self, app: &AppHandle, model_id: String) -> Result<LlamaStatus> {
         self.stop_embedding().await?;
+
+        let model_size = std::fs::metadata(models::model_path(&model_id)?)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        preflight_vram(self, crate::slots::Role::Embed, model_size).await?;
+
         let port = 8182;
         kill_orphan_on_port(port).await;
 
@@ -379,6 +391,11 @@ impl LlamaState {
         {
             let _ = prev.child.kill().await;
         }
+
+        let model_size = std::fs::metadata(models::model_path(&model_id)?)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        preflight_vram(self, crate::slots::Role::Vision, model_size).await?;
 
         let preferred = crate::slots::Role::Vision.default_port();
         kill_orphan_on_port(preferred).await;
@@ -454,6 +471,48 @@ impl LlamaState {
             .get(crate::slots::Role::Vision)
             .map(|e| (e.port, e.model_id.clone()))
     }
+}
+
+/// Pre-flight check: would loading `new_role` with the given file size
+/// exceed available VRAM, given what's already loaded? Returns Ok if
+/// fine, or Err with a user-readable message. CPU-only hardware skips
+/// the check and returns Ok.
+async fn preflight_vram(
+    state: &LlamaState,
+    new_role: crate::slots::Role,
+    new_size_bytes: u64,
+) -> Result<()> {
+    let hw = hardware::detect();
+    let Some(avail) = crate::slots::available_gpu_memory_gb(&hw) else {
+        return Ok(());
+    };
+    let table = state.table.lock().await;
+    let mut existing: Vec<u64> = Vec::new();
+    for r in [
+        crate::slots::Role::Chat,
+        crate::slots::Role::Embed,
+        crate::slots::Role::Vision,
+    ] {
+        // Skip the role we're about to (re)load — we'll free its
+        // memory before spawning the new child.
+        if r == new_role {
+            continue;
+        }
+        if let Some(entry) = table.get(r) {
+            if let Ok(p) = models::model_path(&entry.model_id) {
+                if let Ok(meta) = std::fs::metadata(p) {
+                    existing.push(meta.len());
+                }
+            }
+        }
+    }
+    drop(table);
+    if !crate::slots::fits_with_existing(&existing, new_size_bytes, avail) {
+        return Err(anyhow!(
+            "loading this model would exceed available GPU memory ({avail:.1} GB). Unload another slot first."
+        ));
+    }
+    Ok(())
 }
 
 fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
