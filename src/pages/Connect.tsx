@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Loader2, Wifi, KeyRound } from "lucide-react";
 import { pairWithServer, probeServer } from "../lib/api";
 import { useApp } from "../lib/store";
@@ -21,6 +21,20 @@ export function Connect() {
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Re-render when the browser's online/offline status flips so the
+  // offline hint below updates without waiting for the user to type.
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onChange = () => force((n) => n + 1);
+    window.addEventListener("online", onChange);
+    window.addEventListener("offline", onChange);
+    return () => {
+      window.removeEventListener("online", onChange);
+      window.removeEventListener("offline", onChange);
+    };
+  }, []);
 
   async function connect(e: React.FormEvent) {
     e.preventDefault();
@@ -82,6 +96,11 @@ export function Connect() {
               className="flex-1 bg-transparent outline-none text-sm tracking-[0.4em] font-mono"
             />
           </label>
+          {typeof navigator !== "undefined" && !navigator.onLine && (
+            <p className="text-xs text-amber-300 bg-amber-500/10 rounded-md px-3 py-2">
+              Your phone says it's offline — connect to the same Wi-Fi as the desktop, then try again.
+            </p>
+          )}
           {error && (
             <p className="text-xs text-[var(--color-danger)] bg-[var(--color-danger)]/10 rounded-md px-3 py-2">{error}</p>
           )}
