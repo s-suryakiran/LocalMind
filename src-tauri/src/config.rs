@@ -71,3 +71,9 @@ pub fn synapse_cert_path() -> PathBuf {
 pub fn synapse_key_path() -> PathBuf {
     data_dir().join("synapse-key.pem")
 }
+
+/// Plan 2 multi-model: persisted snapshot of which models are loaded
+/// in which slots. Read on boot to restore the active slot set.
+pub fn slots_state_path() -> PathBuf {
+    data_dir().join("slots.json")
+}

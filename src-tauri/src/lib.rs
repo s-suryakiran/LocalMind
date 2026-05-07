@@ -8,6 +8,7 @@ mod models;
 mod rag;
 mod sd;
 mod slots;
+mod slots_persist;
 mod server;
 mod synapse;
 mod synapse_proto;
@@ -418,6 +419,36 @@ pub fn run() {
                     Ok(url) => {
                         holder2.lan_url.set(url.clone());
                         let _ = handle.emit("lan:ready", url);
+
+                        // Plan 2 multi-model: restore any slots that
+                        // were active in the last session. Failures
+                        // here are logged, not fatal — a missing model
+                        // file (e.g. user deleted it between sessions)
+                        // shouldn't block boot.
+                        let llama_for_restore = holder2.llama.clone();
+                        let app_for_restore = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let snap = slots_persist::load();
+                            if let Some(id) = snap.chat_model_id {
+                                let settings = LlamaSettings {
+                                    model_id: id,
+                                    ..Default::default()
+                                };
+                                if let Err(e) = llama_for_restore.start(&app_for_restore, settings).await {
+                                    eprintln!("slots restore (chat): {e}");
+                                }
+                            }
+                            if let Some(id) = snap.embed_model_id {
+                                if let Err(e) = llama_for_restore.start_embedding(&app_for_restore, id).await {
+                                    eprintln!("slots restore (embed): {e}");
+                                }
+                            }
+                            if let (Some(id), Some(mmproj)) = (snap.vision_model_id, snap.vision_mmproj_id) {
+                                if let Err(e) = llama_for_restore.start_vision(&app_for_restore, id, mmproj).await {
+                                    eprintln!("slots restore (vision): {e}");
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("LAN server failed: {e}");

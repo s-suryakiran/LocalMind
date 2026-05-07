@@ -147,6 +147,7 @@ impl LlamaState {
         // Synapse host proxies are tied to the chat slot's lifecycle —
         // tear them down whenever chat goes away. Phase 3 invariant.
         self.host_proxy.stop_all().await;
+        persist_snapshot(self).await;
         Ok(())
     }
 
@@ -159,6 +160,7 @@ impl LlamaState {
         {
             let _ = entry.child.kill().await;
         }
+        persist_snapshot(self).await;
         Ok(())
     }
 
@@ -314,6 +316,7 @@ impl LlamaState {
             serde_json::json!({ "port": port, "modelId": settings.model_id, "stream": "chat" }),
         );
 
+        persist_snapshot(self).await;
         Ok(self.status().await)
     }
 
@@ -372,6 +375,7 @@ impl LlamaState {
             serde_json::json!({ "port": port, "modelId": model_id, "stream": "embed" }),
         );
 
+        persist_snapshot(self).await;
         Ok(self.status().await)
     }
 
@@ -450,6 +454,7 @@ impl LlamaState {
             serde_json::json!({ "port": port, "modelId": model_id, "stream": "vision" }),
         );
 
+        persist_snapshot(self).await;
         Ok(self.status().await)
     }
 
@@ -462,6 +467,7 @@ impl LlamaState {
         {
             let _ = entry.child.kill().await;
         }
+        persist_snapshot(self).await;
         Ok(())
     }
 
@@ -531,6 +537,17 @@ async fn preflight_vram(
         ));
     }
     Ok(())
+}
+
+/// Snapshot the active slot set to disk so a relaunch can re-hydrate.
+/// Failures are logged but never returned — persistence is a
+/// nice-to-have, not a correctness requirement.
+async fn persist_snapshot(state: &LlamaState) {
+    let status = state.status().await;
+    let snap = crate::slots_persist::snapshot_from_status(&status.slots);
+    if let Err(e) = crate::slots_persist::save(&snap) {
+        eprintln!("slots persist failed: {e}");
+    }
 }
 
 fn pipe_output(app: &AppHandle, child: &mut Child, tag: &str) {
