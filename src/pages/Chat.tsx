@@ -16,11 +16,12 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
   const {
     conversations, activeConvId, createConversation, updateConversation, renameConversation,
     activeModelId, setActiveModelId, installed, llama, setLlama, setView,
-    ragDocs, setRagDocs, toggleRagDoc, synapse,
+    ragDocs, setRagDocs, toggleRagDoc, synapse, online,
   } = useApp();
   const remote = !isTauri();
   // On the phone we don't pick a model — we use whatever the host has loaded.
   const effectiveModelId = remote ? (llama.modelId ?? null) : activeModelId;
+  const canCompose = !!effectiveModelId && (!remote || online);
 
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -347,9 +348,15 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
                 }
               }}
               rows={1}
-              placeholder={effectiveModelId ? "Message your model…" : remote ? "Load a model on the desktop first" : "Pick a model to start"}
+              placeholder={
+                !effectiveModelId
+                  ? remote ? "Load a model on the desktop first" : "Pick a model to start"
+                  : remote && !online
+                    ? "Host offline — reconnect to send"
+                    : "Message your model…"
+              }
               className="flex-1 resize-none bg-transparent px-3 py-3 outline-none text-sm max-h-48"
-              disabled={!effectiveModelId}
+              disabled={!canCompose}
             />
             <button
               onClick={startRecording}
@@ -363,7 +370,7 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
             </button>
             <button
               onClick={sending ? stop : send}
-              disabled={!effectiveModelId || (!sending && !input.trim() && pendingImages.length === 0)}
+              disabled={!canCompose || (!sending && !input.trim() && pendingImages.length === 0)}
               className={cn(
                 "m-1.5 w-9 h-9 rounded-xl grid place-items-center transition-colors",
                 sending
