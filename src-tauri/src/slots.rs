@@ -103,6 +103,33 @@ impl SlotTable {
     }
 }
 
+/// Pick a free port. Tries `preferred` first, then walks `pool` in order.
+/// `is_free(port)` returns true when the port is bindable.
+///
+/// Pure over the probe so we can unit-test without binding sockets;
+/// the production caller passes a probe that does a real `TcpListener::bind`.
+pub fn pick_port<F: Fn(u16) -> bool>(preferred: u16, pool: &[u16], is_free: F) -> Option<u16> {
+    if is_free(preferred) {
+        return Some(preferred);
+    }
+    pool.iter().copied().find(|&p| p != preferred && is_free(p))
+}
+
+/// Production probe: try to bind, drop the listener immediately.
+pub fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Default pool per role. We pick small, contiguous ranges so a curious
+/// user `lsof`-ing the desktop sees obvious neighbours.
+pub fn port_pool(role: Role) -> Vec<u16> {
+    match role {
+        Role::Chat => vec![8181, 8184, 8185, 8186],
+        Role::Embed => vec![8182, 8187, 8188, 8189],
+        Role::Vision => vec![8183, 8190, 8191, 8192],
+    }
+}
+
 /// One slot's externally-visible state. Returned to the frontend as
 /// part of `LlamaStatus.slots`.
 #[derive(Debug, Clone, Serialize)]
@@ -213,5 +240,26 @@ mod tests {
         let embed = statuses.iter().find(|s| s.role == Role::Embed).unwrap();
         assert!(embed.running);
         assert_eq!(embed.model_id.as_deref(), Some("nomic-embed"));
+    }
+
+    #[test]
+    fn allocator_returns_preferred_when_free() {
+        let probe = |_: u16| true;
+        let port = pick_port(8181, &[8181, 8190], probe);
+        assert_eq!(port, Some(8181));
+    }
+
+    #[test]
+    fn allocator_skips_busy_preferred() {
+        let probe = |p: u16| p != 8181;
+        let port = pick_port(8181, &[8181, 8182], probe);
+        assert_eq!(port, Some(8182));
+    }
+
+    #[test]
+    fn allocator_returns_none_when_all_busy() {
+        let probe = |_: u16| false;
+        let port = pick_port(8181, &[8181, 8182, 8183], probe);
+        assert_eq!(port, None);
     }
 }
