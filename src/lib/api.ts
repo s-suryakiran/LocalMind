@@ -154,6 +154,9 @@ export const api = {
     invoke<LlamaStatus>("start_slot", { role, modelId, mmprojId }),
   stopSlot: (role: import("./types").Role) =>
     invoke<void>("stop_slot", { role }),
+  voiceTranscribeFile: (path: string) =>
+    invoke<import("./types").VoiceTranscript>("voice_transcribe_file", { path }),
+  ensureVoiceEngine: () => invoke<string>("ensure_voice_engine"),
 };
 
 export type ChatContentPart =

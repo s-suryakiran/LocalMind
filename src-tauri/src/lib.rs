@@ -345,6 +345,27 @@ async fn start_slot(
 }
 
 #[tauri::command]
+async fn voice_transcribe_file(
+    app: AppHandle,
+    path: String,
+) -> Result<voice::VoiceTranscript, String> {
+    voice::transcribe_file(&app, std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ensure_voice_engine(app: AppHandle) -> Result<String, String> {
+    binaries::ensure_sherpa_onnx(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    let dir = binaries::ensure_diarization_models(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(dir.display().to_string())
+}
+
+#[tauri::command]
 async fn stop_slot(state: State<'_, Arc<AppStateHolder>>, role: slots::Role) -> Result<(), String> {
     let result = match role {
         slots::Role::Chat => state.llama.stop().await,
@@ -506,6 +527,8 @@ pub fn run() {
             synapse_active_sessions,
             start_slot,
             stop_slot,
+            voice_transcribe_file,
+            ensure_voice_engine,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
