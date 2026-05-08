@@ -14,6 +14,7 @@ mod synapse;
 mod synapse_proto;
 mod synapse_tls;
 mod synapse_token;
+mod voice;
 mod voice_audio;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
