@@ -157,6 +157,8 @@ export const api = {
   voiceTranscribeFile: (path: string) =>
     invoke<import("./types").VoiceTranscript>("voice_transcribe_file", { path }),
   ensureVoiceEngine: () => invoke<string>("ensure_voice_engine"),
+  voiceSaveRecording: (bytes: number[], ext: string) =>
+    invoke<string>("voice_save_recording", { bytes, ext }),
 };
 
 export type ChatContentPart =

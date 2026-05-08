@@ -366,6 +366,27 @@ async fn ensure_voice_engine(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn voice_save_recording(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+    // Bypass tauri-plugin-fs's ACL — the recording bytes come from
+    // the user's mic via MediaRecorder in the webview, and we just
+    // need a temp file path to feed into transcribe_file. Keeping
+    // this in Rust means no fs scope to wrangle.
+    let safe_ext = ext
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    let ext = if safe_ext.is_empty() {
+        "bin".to_string()
+    } else {
+        safe_ext
+    };
+    let path = std::env::temp_dir().join(format!("localmind-rec-{}.{ext}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
 async fn stop_slot(state: State<'_, Arc<AppStateHolder>>, role: slots::Role) -> Result<(), String> {
     let result = match role {
         slots::Role::Chat => state.llama.stop().await,
@@ -529,6 +550,7 @@ pub fn run() {
             stop_slot,
             voice_transcribe_file,
             ensure_voice_engine,
+            voice_save_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

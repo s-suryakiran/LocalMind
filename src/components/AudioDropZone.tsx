@@ -88,13 +88,11 @@ export function AudioDropZone({ onTranscript }: { onTranscript: (t: VoiceTranscr
       const blob = new Blob(chunksRef.current, { type: mimeRef.current });
       const buf = new Uint8Array(await blob.arrayBuffer());
       try {
-        const fs = await import("@tauri-apps/plugin-fs");
-        const pathApi = await import("@tauri-apps/api/path");
-        const filename = `localmind-rec-${Date.now()}.${extForMime(mimeRef.current)}`;
-        await fs.writeFile(filename, buf, { baseDir: fs.BaseDirectory.Temp });
-        const tmpDir = await pathApi.tempDir();
-        const fullPath = await pathApi.join(tmpDir, filename);
-        await runTranscription(fullPath);
+        const path = await api.voiceSaveRecording(
+          Array.from(buf),
+          extForMime(mimeRef.current),
+        );
+        await runTranscription(path);
       } catch (e: any) {
         setError(`failed to save recording: ${e?.message ?? e}`);
       }
