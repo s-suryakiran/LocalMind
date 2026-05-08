@@ -135,30 +135,34 @@ fn parse_diarization_stdout(stdout: &str) -> Result<Vec<Segment>> {
     let mut segs = Vec::new();
     for raw in stdout.lines() {
         let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
+        // Real format: "<start_s> -- <end_s> speaker_<NN>". Banner lines
+        // (config dump, "Started", warnings) are skipped by the shape check.
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
+        if parts.len() != 4 || parts[1] != "--" {
             continue;
         }
         let start_s: f32 = match parts[0].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let end_s: f32 = match parts[1].parse() {
+        let end_s: f32 = match parts[2].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let speaker: u32 = match parts[2].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
+        // sherpa emits 1-indexed labels (speaker_01, speaker_02, …).
+        // Store 0-indexed so the frontend's `Speaker N+1` display matches.
+        let raw_id: u32 = match parts[3]
+            .strip_prefix("speaker_")
+            .and_then(|n| n.parse().ok())
+        {
+            Some(v) => v,
+            None => continue,
         };
         if end_s > start_s {
             segs.push(Segment {
                 start_s,
                 end_s,
-                speaker,
+                speaker: raw_id.saturating_sub(1),
             });
         }
     }
@@ -226,28 +230,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_diarization_three_columns() {
-        let s = "
-0.000 1.234 0
-1.234 2.500 1
-2.500 5.000 0
-";
+    fn parses_diarization_real_sherpa_output() {
+        // Captured verbatim from sherpa-onnx-offline-speaker-diarization
+        // running on a 3.3s recording. Format: "<start> -- <end> speaker_<NN>".
+        let s = "OfflineSpeakerDiarizationConfig(segmentation=...)\n\
+                 Started\n\
+                 0.031 -- 2.495 speaker_01\n";
+        let segs = parse_diarization_stdout(s).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!((segs[0].start_s - 0.031).abs() < 1e-3);
+        assert!((segs[0].end_s - 2.495).abs() < 1e-3);
+        // sherpa labels are 1-indexed; we normalize to 0-indexed.
+        assert_eq!(segs[0].speaker, 0);
+    }
+
+    #[test]
+    fn parses_diarization_multiple_speakers_zero_indexed() {
+        let s = "0.000 -- 1.234 speaker_01\n\
+                 1.234 -- 2.500 speaker_02\n\
+                 2.500 -- 5.000 speaker_01\n";
         let segs = parse_diarization_stdout(s).unwrap();
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0].speaker, 0);
-        assert!((segs[1].start_s - 1.234).abs() < 1e-3);
+        assert_eq!(segs[1].speaker, 1);
+        assert_eq!(segs[2].speaker, 0);
     }
 
     #[test]
     fn parses_diarization_skips_garbage() {
-        let s = "
-launching pipeline
-0.0 1.0 0
-WARNING: low confidence
-1.0 2.0 1
-";
+        let s = "launching pipeline\n\
+                 0.0 -- 1.0 speaker_01\n\
+                 WARNING: low confidence\n\
+                 1.0 -- 2.0 speaker_02\n";
         let segs = parse_diarization_stdout(s).unwrap();
         assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn parses_diarization_speaker_00_does_not_underflow() {
+        // Defensive: if sherpa ever emits 0-indexed labels, store 0 not u32::MAX.
+        let s = "0.0 -- 1.0 speaker_00\n";
+        let segs = parse_diarization_stdout(s).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].speaker, 0);
     }
 
     #[test]
