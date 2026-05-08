@@ -659,8 +659,22 @@ fn emit(app: &AppHandle, stage: &str, downloaded: u64, total: u64, message: &str
 /// land in `bin_dir()` next to llama-server.
 pub async fn ensure_sherpa_onnx(app: &AppHandle) -> Result<PathBuf> {
     let path = config::sherpa_bin_path();
-    if path.exists() && config::sherpa_diarization_bin_path().exists() {
+    if path.exists()
+        && config::sherpa_diarization_bin_path().exists()
+        && sherpa_libs_present(&config::bin_dir())
+    {
         return Ok(path);
+    }
+
+    // Repair pass: if the binaries are present but shared libraries
+    // are missing, the previous install flattened only executables.
+    // Walk the existing bin_dir for orphaned libs in extracted
+    // subdirectories before falling through to a full re-download.
+    if path.exists() && config::sherpa_diarization_bin_path().exists() {
+        flatten_sherpa_extraction(&config::bin_dir())?;
+        if sherpa_libs_present(&config::bin_dir()) {
+            return Ok(path);
+        }
     }
 
     let hw = hardware::detect();
@@ -721,17 +735,11 @@ pub async fn ensure_sherpa_onnx(app: &AppHandle) -> Result<PathBuf> {
     extract_tar_auto(&tmp, &config::bin_dir())?;
     let _ = std::fs::remove_file(&tmp);
 
-    // The archive lays binaries out under
-    // `sherpa-onnx-vX.Y.Z-<platform>/bin/`; flatten so they sit
-    // alongside llama-server. We search bin_dir() for the freshly-
-    // extracted CLI names and move them up.
-    flatten_into_bin_dir(
-        &config::bin_dir(),
-        &[
-            "sherpa-onnx-offline",
-            "sherpa-onnx-offline-speaker-diarization",
-        ],
-    )?;
+    // The archive lays binaries + shared libs out under
+    // `sherpa-onnx-vX.Y.Z-<platform>/bin/` and `.../lib/` respectively.
+    // Flatten BOTH binaries and dylibs into bin_dir so the binary's
+    // @rpath of `bin/<libname>` resolves at runtime.
+    flatten_sherpa_extraction(&config::bin_dir())?;
 
     #[cfg(unix)]
     {
@@ -779,6 +787,61 @@ fn extract_tar_auto(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Walks `bin_dir` recursively and pulls up the sherpa-onnx CLIs and
+/// every shared library (`.dylib`/`.so`/`.dll`) it finds into the
+/// top-level `bin_dir`. Idempotent: if a file is already in the right
+/// place we skip the rename.
+fn flatten_sherpa_extraction(bin_dir: &Path) -> Result<()> {
+    fn walk(dir: &Path, bin_dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, bin_dir)?;
+                continue;
+            }
+            let fname = match p.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let is_sherpa_bin = fname.starts_with("sherpa-onnx-offline");
+            let is_shlib = fname.ends_with(".dylib")
+                || fname.ends_with(".so")
+                || fname.contains(".so.")
+                || fname.ends_with(".dll");
+            if !is_sherpa_bin && !is_shlib {
+                continue;
+            }
+            let dst = bin_dir.join(fname);
+            if dst != p && !dst.exists() {
+                let _ = std::fs::rename(&p, &dst);
+            }
+        }
+        Ok(())
+    }
+    walk(bin_dir, bin_dir)
+}
+
+/// True iff at least one onnxruntime library exists at the top level of
+/// `bin_dir`. The exact filename is version-suffixed (e.g.
+/// `libonnxruntime.1.24.4.dylib`) so we match by prefix + extension.
+fn sherpa_libs_present(bin_dir: &Path) -> bool {
+    let Ok(read) = std::fs::read_dir(bin_dir) else {
+        return false;
+    };
+    for entry in read.flatten() {
+        let fname = entry.file_name();
+        let s = fname.to_string_lossy();
+        if s.starts_with("libonnxruntime")
+            && (s.ends_with(".dylib") || s.contains(".so") || s.ends_with(".dll"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(dead_code)]
 fn flatten_into_bin_dir(bin_dir: &Path, wanted: &[&str]) -> Result<()> {
     fn walk(dir: &Path, wanted: &[&str], bin_dir: &Path) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
