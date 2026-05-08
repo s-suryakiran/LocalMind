@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { Cpu, Wifi, Smartphone, Copy, Check, KeyRound, LogOut } from "lucide-react";
+import { Cpu, Wifi, Smartphone, Copy, Check, KeyRound, LogOut, Mic } from "lucide-react";
 import QRCode from "qrcode";
 import { useApp } from "../lib/store";
 import { api } from "../lib/api";
-import type { BinaryProgress } from "../lib/types";
+import type { BinaryProgress, VoiceEngineKind } from "../lib/types";
 import { listen } from "../lib/api";
 import { isTauri } from "../lib/util";
 
@@ -153,8 +153,40 @@ export function Settings() {
           </Section>
         )}
 
+        <VoiceSection />
+
       </div>
     </div>
+  );
+}
+
+function VoiceSection() {
+  const { voiceEngineOverride, setVoiceEngineOverride } = useApp();
+  return (
+    <Section title="Voice input" icon={<Mic size={14} />}>
+      <p className="text-xs text-[var(--color-text-muted)] mb-3">
+        Speech-to-text engine. <strong>Local pipeline</strong> uses sherpa-onnx with Whisper-tiny —
+        all processing on your device. <strong>Browser</strong> uses your OS's Web Speech API
+        (less private — Chrome streams audio to Google's servers).
+      </p>
+      <div className="flex gap-2">
+        {(["sherpa", "web-speech"] as VoiceEngineKind[]).map((kind) => (
+          <button
+            key={kind}
+            onClick={() => setVoiceEngineOverride(voiceEngineOverride === kind ? null : kind)}
+            className={
+              "px-3 py-1.5 rounded-md text-xs border " +
+              (voiceEngineOverride === kind
+                ? "bg-[var(--color-accent)]/20 border-[var(--color-accent)]"
+                : "border-[var(--color-border)] hover:border-[var(--color-accent)]/40")
+            }
+          >
+            {kind === "sherpa" ? "Local pipeline" : "Browser (Web Speech)"}
+            {voiceEngineOverride === kind ? " · forced" : ""}
+          </button>
+        ))}
+      </div>
+    </Section>
   );
 }
 
