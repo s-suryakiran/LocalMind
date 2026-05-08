@@ -1,5 +1,6 @@
 import { isTauri } from "./util";
 import { useApp } from "./store";
+import { pickSlotPort, bodyHasImage } from "./slot-routing";
 import type {
   HardwareInfo,
   InstalledModel,
@@ -149,6 +150,10 @@ export const api = {
   setKnownSynapseTokens: (tokens: Record<string, string>) =>
     invoke<void>("set_known_synapse_tokens", { tokens }),
   synapseActiveSessions: () => invoke<number>("synapse_active_sessions"),
+  startSlot: (role: import("./types").Role, modelId: string, mmprojId?: string) =>
+    invoke<LlamaStatus>("start_slot", { role, modelId, mmprojId }),
+  stopSlot: (role: import("./types").Role) =>
+    invoke<void>("stop_slot", { role }),
 };
 
 export type ChatContentPart =
@@ -167,10 +172,13 @@ export async function* streamChat(
   opts: { temperature?: number; maxTokens?: number; signal?: AbortSignal } = {},
 ): AsyncGenerator<string> {
   const conn = connection();
+  const status = useApp.getState().llama;
+  const hasImage = bodyHasImage(messages);
+  const targetPort = conn ? port : (pickSlotPort(status, hasImage) ?? port);
   const base = conn
     ? conn.url.replace(/\/+$/, "")
     : isTauri()
-    ? `http://127.0.0.1:${port}`
+    ? `http://127.0.0.1:${targetPort}`
     : "";
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",

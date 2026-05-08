@@ -8,6 +8,8 @@ mod models;
 mod rag;
 mod sd;
 mod server;
+mod slots;
+mod slots_persist;
 mod synapse;
 mod synapse_proto;
 mod synapse_tls;
@@ -309,6 +311,47 @@ fn synapse_active_sessions() -> u32 {
     auth_proxy::ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[tauri::command]
+async fn start_slot(
+    app: AppHandle,
+    state: State<'_, Arc<AppStateHolder>>,
+    role: slots::Role,
+    model_id: String,
+    mmproj_id: Option<String>,
+) -> Result<LlamaStatus, String> {
+    let result = match role {
+        slots::Role::Chat => {
+            // Use the existing rich path — Synapse workers, host weight,
+            // mmproj as a chat-attached model — by constructing a minimal
+            // LlamaSettings. Callers that need flags (context, etc.)
+            // should still use the legacy start_llama command.
+            let settings = LlamaSettings {
+                model_id,
+                mmproj_id,
+                ..Default::default()
+            };
+            state.llama.start(&app, settings).await
+        }
+        slots::Role::Embed => state.llama.start_embedding(&app, model_id).await,
+        slots::Role::Vision => {
+            let mmproj =
+                mmproj_id.ok_or_else(|| "vision slot requires an mmproj_id".to_string())?;
+            state.llama.start_vision(&app, model_id, mmproj).await
+        }
+    };
+    result.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_slot(state: State<'_, Arc<AppStateHolder>>, role: slots::Role) -> Result<(), String> {
+    let result = match role {
+        slots::Role::Chat => state.llama.stop().await,
+        slots::Role::Embed => state.llama.stop_embedding().await,
+        slots::Role::Vision => state.llama.stop_vision().await,
+    };
+    result.map_err(|e| e.to_string())
+}
+
 fn generate_pin() -> String {
     let raw = uuid::Uuid::new_v4().as_u128();
     format!("{:06}", (raw % 1_000_000) as u32)
@@ -373,6 +416,46 @@ pub fn run() {
                     Ok(url) => {
                         holder2.lan_url.set(url.clone());
                         let _ = handle.emit("lan:ready", url);
+
+                        // Plan 2 multi-model: restore any slots that
+                        // were active in the last session. Failures
+                        // here are logged, not fatal — a missing model
+                        // file (e.g. user deleted it between sessions)
+                        // shouldn't block boot.
+                        let llama_for_restore = holder2.llama.clone();
+                        let app_for_restore = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let snap = slots_persist::load();
+                            if let Some(id) = snap.chat_model_id {
+                                let settings = LlamaSettings {
+                                    model_id: id,
+                                    ..Default::default()
+                                };
+                                if let Err(e) =
+                                    llama_for_restore.start(&app_for_restore, settings).await
+                                {
+                                    eprintln!("slots restore (chat): {e}");
+                                }
+                            }
+                            if let Some(id) = snap.embed_model_id {
+                                if let Err(e) = llama_for_restore
+                                    .start_embedding(&app_for_restore, id)
+                                    .await
+                                {
+                                    eprintln!("slots restore (embed): {e}");
+                                }
+                            }
+                            if let (Some(id), Some(mmproj)) =
+                                (snap.vision_model_id, snap.vision_mmproj_id)
+                            {
+                                if let Err(e) = llama_for_restore
+                                    .start_vision(&app_for_restore, id, mmproj)
+                                    .await
+                                {
+                                    eprintln!("slots restore (vision): {e}");
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("LAN server failed: {e}");
@@ -419,6 +502,8 @@ pub fn run() {
             rotate_synapse_token,
             set_known_synapse_tokens,
             synapse_active_sessions,
+            start_slot,
+            stop_slot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

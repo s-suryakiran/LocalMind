@@ -284,10 +284,10 @@ Shipped:
 - [x] Synapse v3 — token-gated auth proxy, HMAC-signed beacons, live tok/s + RTT, manual layer split, marketplace size hints
 - [x] Synapse v4 — TLS on the proxy channel, mid-inference reconnect, auto-tuned layer split, multi-host workers
 - [x] Service-worker offline shell for the PWA
+- [x] Multi-model concurrent serving (chat + embed + vision in one session)
 
 Next:
 - [ ] Tauri Mobile (iOS/Android) reaching parity with the PWA
-- [ ] Multi-model concurrent serving (chat + embed + vision in one session)
 - [ ] Speaker diarization for voice
 - [ ] Plugin system for custom tools
 

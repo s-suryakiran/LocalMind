@@ -17,6 +17,19 @@ use std::sync::{Arc, Mutex};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use uuid::Uuid;
 
+/// Cheap scan of a JSON chat body for any `image_url` content part.
+/// We avoid full deserialization: the body can be large and we need
+/// to forward it through verbatim — re-serializing would change byte
+/// layout and break tools that hash request bodies.
+fn body_has_image(body: &[u8]) -> bool {
+    // String-search for the literal field name. Safe: chat-completions
+    // bodies are JSON, and `"image_url"` only appears as a key in the
+    // OpenAI multimodal content-part schema. False positives would
+    // require user prompts containing the exact 11-character literal,
+    // which routes them to vision (capable model) — still correct.
+    memchr::memmem::find(body, b"\"image_url\"").is_some()
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub llama: Arc<LlamaState>,
@@ -206,19 +219,54 @@ async fn proxy_dev_frontend(State(s): State<AppState>, req: Request<Body>) -> Re
 }
 
 async fn proxy_v1(State(s): State<AppState>, req: Request<Body>) -> Response {
-    let st = s.llama.status().await;
-    if !st.running {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no model loaded on host").into_response();
-    }
-    let port = st.port;
+    // Materialize the body so we can inspect it and still forward it.
+    // 64 MB cap matches the existing forward() limit.
     let path = req.uri().path().to_string();
     let qs = req
         .uri()
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("body error: {e}")).into_response(),
+    };
+
+    // Route only /v1/chat/completions; other /v1/* (e.g. /v1/models) stays on chat.
+    let port = if path == "/v1/chat/completions" {
+        let has_image = body_has_image(&body_bytes);
+        match s.llama.route_chat_port(has_image).await {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no chat or vision model loaded",
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        let st = s.llama.status().await;
+        if !st.running {
+            return (StatusCode::SERVICE_UNAVAILABLE, "no model loaded on host").into_response();
+        }
+        st.port
+    };
+
     let url = format!("http://127.0.0.1:{}{}{}", port, path, qs);
-    forward(&s.http, &url, req).await
+
+    // Re-construct a Request<Body> for forward(), since we already
+    // consumed the original body.
+    let mut new_req = Request::builder()
+        .method(method)
+        .uri(format!("{}{}", path, qs))
+        .body(Body::from(body_bytes.clone()))
+        .unwrap();
+    *new_req.headers_mut() = headers;
+
+    forward(&s.http, &url, new_req).await
 }
 
 async fn forward(client: &reqwest::Client, url: &str, req: Request<Body>) -> Response {

@@ -125,6 +125,11 @@ const emptyLlama: LlamaStatus = {
   embeddingRunning: false,
   embeddingPort: 8182,
   embeddingModelId: null,
+  slots: [
+    { role: "chat", running: false, port: 8181, modelId: null, mmprojId: null, pid: null },
+    { role: "embed", running: false, port: 8182, modelId: null, mmprojId: null, pid: null },
+    { role: "vision", running: false, port: 8183, modelId: null, mmprojId: null, pid: null },
+  ],
 };
 
 export const useApp = create<AppState>()(
