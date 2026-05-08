@@ -7,9 +7,9 @@ mod llama;
 mod models;
 mod rag;
 mod sd;
+mod server;
 mod slots;
 mod slots_persist;
-mod server;
 mod synapse;
 mod synapse_proto;
 mod synapse_tls;
@@ -334,8 +334,8 @@ async fn start_slot(
         }
         slots::Role::Embed => state.llama.start_embedding(&app, model_id).await,
         slots::Role::Vision => {
-            let mmproj = mmproj_id
-                .ok_or_else(|| "vision slot requires an mmproj_id".to_string())?;
+            let mmproj =
+                mmproj_id.ok_or_else(|| "vision slot requires an mmproj_id".to_string())?;
             state.llama.start_vision(&app, model_id, mmproj).await
         }
     };
@@ -343,10 +343,7 @@ async fn start_slot(
 }
 
 #[tauri::command]
-async fn stop_slot(
-    state: State<'_, Arc<AppStateHolder>>,
-    role: slots::Role,
-) -> Result<(), String> {
+async fn stop_slot(state: State<'_, Arc<AppStateHolder>>, role: slots::Role) -> Result<(), String> {
     let result = match role {
         slots::Role::Chat => state.llama.stop().await,
         slots::Role::Embed => state.llama.stop_embedding().await,
@@ -434,17 +431,27 @@ pub fn run() {
                                     model_id: id,
                                     ..Default::default()
                                 };
-                                if let Err(e) = llama_for_restore.start(&app_for_restore, settings).await {
+                                if let Err(e) =
+                                    llama_for_restore.start(&app_for_restore, settings).await
+                                {
                                     eprintln!("slots restore (chat): {e}");
                                 }
                             }
                             if let Some(id) = snap.embed_model_id {
-                                if let Err(e) = llama_for_restore.start_embedding(&app_for_restore, id).await {
+                                if let Err(e) = llama_for_restore
+                                    .start_embedding(&app_for_restore, id)
+                                    .await
+                                {
                                     eprintln!("slots restore (embed): {e}");
                                 }
                             }
-                            if let (Some(id), Some(mmproj)) = (snap.vision_model_id, snap.vision_mmproj_id) {
-                                if let Err(e) = llama_for_restore.start_vision(&app_for_restore, id, mmproj).await {
+                            if let (Some(id), Some(mmproj)) =
+                                (snap.vision_model_id, snap.vision_mmproj_id)
+                            {
+                                if let Err(e) = llama_for_restore
+                                    .start_vision(&app_for_restore, id, mmproj)
+                                    .await
+                                {
                                     eprintln!("slots restore (vision): {e}");
                                 }
                             }

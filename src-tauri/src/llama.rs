@@ -136,12 +136,7 @@ impl LlamaState {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        if let Some(mut entry) = self
-            .table
-            .lock()
-            .await
-            .remove(crate::slots::Role::Chat)
-        {
+        if let Some(mut entry) = self.table.lock().await.remove(crate::slots::Role::Chat) {
             let _ = entry.child.kill().await;
         }
         // Synapse host proxies are tied to the chat slot's lifecycle —
@@ -152,12 +147,7 @@ impl LlamaState {
     }
 
     pub async fn stop_embedding(&self) -> Result<()> {
-        if let Some(mut entry) = self
-            .table
-            .lock()
-            .await
-            .remove(crate::slots::Role::Embed)
-        {
+        if let Some(mut entry) = self.table.lock().await.remove(crate::slots::Role::Embed) {
             let _ = entry.child.kill().await;
         }
         persist_snapshot(self).await;
@@ -391,12 +381,7 @@ impl LlamaState {
         mmproj_id: String,
     ) -> Result<LlamaStatus> {
         // Stop any existing vision slot first — we only support one at a time.
-        if let Some(mut prev) = self
-            .table
-            .lock()
-            .await
-            .remove(crate::slots::Role::Vision)
-        {
+        if let Some(mut prev) = self.table.lock().await.remove(crate::slots::Role::Vision) {
             let _ = prev.child.kill().await;
         }
 
@@ -459,12 +444,7 @@ impl LlamaState {
     }
 
     pub async fn stop_vision(&self) -> Result<()> {
-        if let Some(mut entry) = self
-            .table
-            .lock()
-            .await
-            .remove(crate::slots::Role::Vision)
-        {
+        if let Some(mut entry) = self.table.lock().await.remove(crate::slots::Role::Vision) {
             let _ = entry.child.kill().await;
         }
         persist_snapshot(self).await;

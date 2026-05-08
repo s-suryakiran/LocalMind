@@ -143,7 +143,9 @@ use crate::hardware::{Accelerator, HardwareInfo};
 /// OS lives in system RAM.
 pub fn available_gpu_memory_gb(hw: &HardwareInfo) -> Option<f64> {
     match &hw.accelerator {
-        Accelerator::AppleSilicon { unified_memory_gb, .. } => Some(unified_memory_gb * 0.7),
+        Accelerator::AppleSilicon {
+            unified_memory_gb, ..
+        } => Some(unified_memory_gb * 0.7),
         Accelerator::Nvidia { vram_gb, .. } => Some(*vram_gb),
         Accelerator::Amd { vram_gb, .. } => Some(*vram_gb),
         Accelerator::IntelArc { .. } | Accelerator::Cpu => None,
@@ -161,12 +163,11 @@ pub fn estimate_slot_vram_gb(file_size_bytes: u64) -> f64 {
 
 /// Would loading a new model with `new_size_bytes` push total estimated
 /// VRAM use past `available_gb`?
-pub fn fits_with_existing(
-    existing_sizes: &[u64],
-    new_size_bytes: u64,
-    available_gb: f64,
-) -> bool {
-    let used: f64 = existing_sizes.iter().map(|&b| estimate_slot_vram_gb(b)).sum();
+pub fn fits_with_existing(existing_sizes: &[u64], new_size_bytes: u64, available_gb: f64) -> bool {
+    let used: f64 = existing_sizes
+        .iter()
+        .map(|&b| estimate_slot_vram_gb(b))
+        .sum();
     let needed = estimate_slot_vram_gb(new_size_bytes);
     used + needed <= available_gb
 }
@@ -217,11 +218,18 @@ mod tests {
         // we can hold and drop without it actually doing anything.
         #[cfg(target_family = "unix")]
         {
-            tokio::process::Command::new("true").stdout(Stdio::null()).spawn().unwrap()
+            tokio::process::Command::new("true")
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
         }
         #[cfg(target_os = "windows")]
         {
-            tokio::process::Command::new("cmd").args(["/c", "exit"]).stdout(Stdio::null()).spawn().unwrap()
+            tokio::process::Command::new("cmd")
+                .args(["/c", "exit"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
         }
     }
 
@@ -319,7 +327,10 @@ mod tests {
 
     #[test]
     fn available_gpu_memory_apple_silicon_reserves_30pct() {
-        let info = hw(Accelerator::AppleSilicon { chip: "M1 Pro".into(), unified_memory_gb: 16.0 });
+        let info = hw(Accelerator::AppleSilicon {
+            chip: "M1 Pro".into(),
+            unified_memory_gb: 16.0,
+        });
         let avail = available_gpu_memory_gb(&info).unwrap();
         // 70% of 16 = 11.2; allow small float wiggle.
         assert!((avail - 11.2).abs() < 0.01);
@@ -327,7 +338,11 @@ mod tests {
 
     #[test]
     fn available_gpu_memory_nvidia_uses_full_vram() {
-        let info = hw(Accelerator::Nvidia { name: "4090".into(), vram_gb: 24.0, cuda_version: None });
+        let info = hw(Accelerator::Nvidia {
+            name: "4090".into(),
+            vram_gb: 24.0,
+            cuda_version: None,
+        });
         assert_eq!(available_gpu_memory_gb(&info), Some(24.0));
     }
 
