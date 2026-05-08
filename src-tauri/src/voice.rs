@@ -193,8 +193,7 @@ fn parse_asr_stdout(stdout: &str) -> String {
     // Fallback: last non-empty line, stripped.
     stdout
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .rfind(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
         .to_string()
