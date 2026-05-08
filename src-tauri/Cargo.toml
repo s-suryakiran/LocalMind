@@ -63,6 +63,11 @@ rustls-pemfile = "2"
 # Plan 2 multi-model: cheap byte-search for routing /v1/chat/completions
 # bodies to the vision slot when image content parts are present.
 memchr = "2"
+# Plan 3 voice diarization: decode arbitrary audio formats to 16kHz mono
+# PCM (symphonia) and write WAV files for the sherpa-onnx CLI to consume
+# (hound).
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "flac", "aac", "isomp4", "ogg", "vorbis"] }
+hound = "3.5"
 
 [profile.release]
 lto = true

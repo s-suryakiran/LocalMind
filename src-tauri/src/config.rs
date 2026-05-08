@@ -77,3 +77,36 @@ pub fn synapse_key_path() -> PathBuf {
 pub fn slots_state_path() -> PathBuf {
     data_dir().join("slots.json")
 }
+
+// Plan 3 voice diarization: sherpa-onnx CLI binaries + bundled ONNX
+// models + persisted transcript JSON files.
+
+pub fn sherpa_bin_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "sherpa-onnx-offline.exe"
+    } else {
+        "sherpa-onnx-offline"
+    };
+    bin_dir().join(name)
+}
+
+pub fn sherpa_diarization_bin_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "sherpa-onnx-offline-speaker-diarization.exe"
+    } else {
+        "sherpa-onnx-offline-speaker-diarization"
+    };
+    bin_dir().join(name)
+}
+
+pub fn diarization_models_dir() -> PathBuf {
+    let dir = data_dir().join("voice-models");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+pub fn transcripts_dir() -> PathBuf {
+    let dir = data_dir().join("transcripts");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
