@@ -102,7 +102,10 @@ struct Segment {
 
 async fn run_diarization(wav: &Path, models: &Path) -> Result<Vec<Segment>> {
     let bin = config::sherpa_diarization_bin_path();
-    let segmentation = models.join("sherpa-onnx-pyannote-segmentation-3-0.onnx");
+    // Pyannote tarball extracts to a subdirectory containing model.onnx.
+    let segmentation = models
+        .join("sherpa-onnx-pyannote-segmentation-3-0")
+        .join("model.onnx");
     let speaker = models.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
     let out = Command::new(&bin)
         .arg(format!("--segmentation-model={}", segmentation.display()))
@@ -156,9 +159,13 @@ fn parse_diarization_stdout(stdout: &str) -> Result<Vec<Segment>> {
 
 async fn run_asr(wav: &Path, models: &Path) -> Result<String> {
     let bin = config::sherpa_bin_path();
-    let encoder = models.join("sherpa-onnx-whisper-tiny.en-encoder.onnx");
-    let decoder = models.join("sherpa-onnx-whisper-tiny.en-decoder.onnx");
-    let tokens = models.join("sherpa-onnx-whisper-tiny.en-tokens.txt");
+    // sherpa-onnx-whisper-tiny.en tarball extracts into a subdir with
+    // both fp32 and int8-quantized variants. Prefer the int8 ones —
+    // they're ~3x smaller and run on CPU just fine for tiny model size.
+    let whisper_dir = models.join("sherpa-onnx-whisper-tiny.en");
+    let encoder = whisper_dir.join("tiny.en-encoder.int8.onnx");
+    let decoder = whisper_dir.join("tiny.en-decoder.int8.onnx");
+    let tokens = whisper_dir.join("tiny.en-tokens.txt");
     let out = Command::new(&bin)
         .arg(format!("--whisper-encoder={}", encoder.display()))
         .arg(format!("--whisper-decoder={}", decoder.display()))

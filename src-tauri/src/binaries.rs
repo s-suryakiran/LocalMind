@@ -804,45 +804,75 @@ fn flatten_into_bin_dir(bin_dir: &Path, wanted: &[&str]) -> Result<()> {
     walk(bin_dir, wanted, bin_dir)
 }
 
-/// Models the diarization pipeline needs. Pinned URLs from sherpa-onnx's
-/// model zoo. ~120 MB total. We download into `data_dir/voice-models/`.
-const MODEL_URLS: &[(&str, &str)] = &[
-    (
-        "sherpa-onnx-pyannote-segmentation-3-0.onnx",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.onnx",
-    ),
-    (
-        "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
-    ),
-    (
-        "sherpa-onnx-whisper-tiny.en-encoder.onnx",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-encoder.onnx",
-    ),
-    (
-        "sherpa-onnx-whisper-tiny.en-decoder.onnx",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-decoder.onnx",
-    ),
-    (
-        "sherpa-onnx-whisper-tiny.en-tokens.txt",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-tokens.txt",
-    ),
-];
+/// Direct .onnx download — speaker embedding model (single file, ~25 MB).
+const SPEAKER_MODEL_NAME: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+const SPEAKER_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+
+/// Tarballs we download + extract under the models dir. Sherpa packages
+/// pyannote segmentation and whisper-tiny as `.tar.bz2`s, not as
+/// individual .onnx files. Each tarball extracts into its own
+/// subdirectory whose name matches the tarball stem.
+const PYANNOTE_TARBALL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+const PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
+
+const WHISPER_TARBALL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2";
+const WHISPER_DIR: &str = "sherpa-onnx-whisper-tiny.en";
 
 pub async fn ensure_diarization_models(app: &AppHandle) -> Result<PathBuf> {
     let dir = config::diarization_models_dir();
     let client = reqwest::Client::builder()
         .user_agent("LocalMind/0.1")
         .build()?;
-    for (name, url) in MODEL_URLS {
-        let dst = dir.join(name);
-        if dst.exists() {
-            continue;
-        }
-        emit(app, "downloading", 0, 0, &format!("Downloading {name}"));
-        let resp = client.get(*url).send().await?.error_for_status()?;
+
+    // 1. Speaker embedding model (single .onnx).
+    let speaker_dst = dir.join(SPEAKER_MODEL_NAME);
+    if !speaker_dst.exists() {
+        emit(
+            app,
+            "downloading",
+            0,
+            0,
+            &format!("Downloading {SPEAKER_MODEL_NAME}"),
+        );
+        let resp = client
+            .get(SPEAKER_MODEL_URL)
+            .send()
+            .await?
+            .error_for_status()?;
         let bytes = resp.bytes().await?;
-        std::fs::write(&dst, bytes).with_context(|| format!("writing {}", dst.display()))?;
+        std::fs::write(&speaker_dst, bytes)
+            .with_context(|| format!("writing {}", speaker_dst.display()))?;
     }
+
+    // 2. Pyannote segmentation tarball.
+    if !dir.join(PYANNOTE_DIR).exists() {
+        download_and_extract_tar(app, &client, PYANNOTE_TARBALL, &dir).await?;
+    }
+
+    // 3. Whisper-tiny.en tarball (encoder + decoder + tokens.txt).
+    if !dir.join(WHISPER_DIR).exists() {
+        download_and_extract_tar(app, &client, WHISPER_TARBALL, &dir).await?;
+    }
+
     Ok(dir)
+}
+
+async fn download_and_extract_tar(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &str,
+    dest_dir: &Path,
+) -> Result<()> {
+    let name = url.rsplit('/').next().unwrap_or("model-archive.tar.bz2");
+    emit(app, "downloading", 0, 0, &format!("Downloading {name}"));
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let bytes = resp.bytes().await?;
+    let tmp = dest_dir.join(name);
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    emit(app, "extracting", 0, 0, &format!("Extracting {name}"));
+    extract_tar_auto(&tmp, dest_dir)?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
 }
