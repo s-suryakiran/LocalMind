@@ -15,6 +15,25 @@ pub struct DownloadProgress {
     pub message: String,
 }
 
+/// Keywords for matching a sherpa-onnx GitHub-release asset to this
+/// platform. Sherpa names artifacts like:
+///   sherpa-onnx-v1.10.x-osx-arm64.tar.bz2
+///   sherpa-onnx-v1.10.x-linux-x64.tar.bz2
+///   sherpa-onnx-v1.10.x-win-x64-static.tar.bz2
+/// Pre-Phase: upstream naming has shifted before, so verify with
+/// `curl https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/latest`
+/// if `ensure_sherpa_onnx` fails to find an asset at runtime.
+fn sherpa_asset_keywords(hw: &hardware::HardwareInfo) -> Vec<&'static str> {
+    match hw.os.as_str() {
+        "macos" => match hw.arch.as_str() {
+            "aarch64" => vec!["osx", "arm64"],
+            _ => vec!["osx", "x64"],
+        },
+        "windows" => vec!["win", "x64", "static"],
+        _ => vec!["linux", "x64"],
+    }
+}
+
 fn llama_asset_keywords(hw: &hardware::HardwareInfo) -> Vec<&'static str> {
     match &hw.accelerator {
         Accelerator::AppleSilicon { .. } => vec!["macos", "arm64"],
@@ -630,4 +649,200 @@ fn emit(app: &AppHandle, stage: &str, downloaded: u64, total: u64, message: &str
             message: message.to_string(),
         },
     );
+}
+
+// ---- Plan 3 voice diarization: sherpa-onnx CLI + model bundle ----
+
+/// Download the sherpa-onnx CLI bundle on first use. The archive
+/// contains both `sherpa-onnx-offline` (ASR) and
+/// `sherpa-onnx-offline-speaker-diarization` (diarization). Both
+/// land in `bin_dir()` next to llama-server.
+pub async fn ensure_sherpa_onnx(app: &AppHandle) -> Result<PathBuf> {
+    let path = config::sherpa_bin_path();
+    if path.exists() && config::sherpa_diarization_bin_path().exists() {
+        return Ok(path);
+    }
+
+    let hw = hardware::detect();
+    let keywords = sherpa_asset_keywords(&hw);
+
+    emit(
+        app,
+        "downloading",
+        0,
+        0,
+        "Fetching sherpa-onnx release info",
+    );
+    let client = reqwest::Client::builder()
+        .user_agent("LocalMind/0.1")
+        .build()?;
+    let release: serde_json::Value = client
+        .get("https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/latest")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let assets = release["assets"]
+        .as_array()
+        .ok_or_else(|| anyhow!("no assets in sherpa-onnx release"))?;
+    let asset = pick_sherpa_asset(assets, &keywords)
+        .ok_or_else(|| anyhow!("no matching sherpa-onnx asset (wanted {:?})", keywords))?;
+    let url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sherpa-onnx asset url"))?;
+    let total = asset["size"].as_u64().unwrap_or(0);
+    let name = asset["name"]
+        .as_str()
+        .unwrap_or("sherpa-archive")
+        .to_string();
+
+    emit(app, "downloading", 0, total, &format!("Downloading {name}"));
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut downloaded = 0u64;
+    let tmp = config::bin_dir().join(&name);
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    use tokio::io::AsyncWriteExt;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        emit(app, "downloading", downloaded, total, "");
+    }
+    file.flush().await?;
+    drop(file);
+
+    emit(
+        app,
+        "extracting",
+        downloaded,
+        total,
+        "Extracting sherpa-onnx",
+    );
+    extract_tar_auto(&tmp, &config::bin_dir())?;
+    let _ = std::fs::remove_file(&tmp);
+
+    // The archive lays binaries out under
+    // `sherpa-onnx-vX.Y.Z-<platform>/bin/`; flatten so they sit
+    // alongside llama-server. We search bin_dir() for the freshly-
+    // extracted CLI names and move them up.
+    flatten_into_bin_dir(
+        &config::bin_dir(),
+        &[
+            "sherpa-onnx-offline",
+            "sherpa-onnx-offline-speaker-diarization",
+        ],
+    )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [
+            &config::sherpa_bin_path(),
+            &config::sherpa_diarization_bin_path(),
+        ] {
+            if let Ok(meta) = std::fs::metadata(p) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(p, perms);
+            }
+        }
+    }
+
+    Ok(path)
+}
+
+fn pick_sherpa_asset<'a>(
+    assets: &'a [serde_json::Value],
+    keywords: &[&str],
+) -> Option<&'a serde_json::Value> {
+    assets.iter().find(|a| {
+        let name = a["name"].as_str().unwrap_or("").to_lowercase();
+        // Must be a tar.bz2 (the binary distribution) and match all
+        // platform keywords.
+        name.ends_with(".tar.bz2") && keywords.iter().all(|k| name.contains(&k.to_lowercase()))
+    })
+}
+
+/// Generic tar extractor that auto-detects compression (gzip, bzip2,
+/// xz) — modern `tar -xf` handles all three on macOS/Linux/Windows.
+fn extract_tar_auto(archive: &Path, dest: &Path) -> Result<()> {
+    let status = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .context("failed to spawn tar")?;
+    if !status.success() {
+        return Err(anyhow!("tar extraction failed for {}", archive.display()));
+    }
+    Ok(())
+}
+
+fn flatten_into_bin_dir(bin_dir: &Path, wanted: &[&str]) -> Result<()> {
+    fn walk(dir: &Path, wanted: &[&str], bin_dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, wanted, bin_dir)?;
+                continue;
+            }
+            let fname_lossy = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Match either exact name (Unix) or with .exe (Windows).
+            for w in wanted {
+                if fname_lossy == *w || fname_lossy == format!("{w}.exe") {
+                    let dst = bin_dir.join(fname_lossy);
+                    if dst != p {
+                        let _ = std::fs::rename(&p, &dst);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    walk(bin_dir, wanted, bin_dir)
+}
+
+/// Models the diarization pipeline needs. Pinned URLs from sherpa-onnx's
+/// model zoo. ~120 MB total. We download into `data_dir/voice-models/`.
+const MODEL_URLS: &[(&str, &str)] = &[
+    (
+        "sherpa-onnx-pyannote-segmentation-3-0.onnx",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.onnx",
+    ),
+    (
+        "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+    ),
+    (
+        "sherpa-onnx-whisper-tiny.en-encoder.onnx",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-encoder.onnx",
+    ),
+    (
+        "sherpa-onnx-whisper-tiny.en-decoder.onnx",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-decoder.onnx",
+    ),
+    (
+        "sherpa-onnx-whisper-tiny.en-tokens.txt",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en-tokens.txt",
+    ),
+];
+
+pub async fn ensure_diarization_models(app: &AppHandle) -> Result<PathBuf> {
+    let dir = config::diarization_models_dir();
+    let client = reqwest::Client::builder()
+        .user_agent("LocalMind/0.1")
+        .build()?;
+    for (name, url) in MODEL_URLS {
+        let dst = dir.join(name);
+        if dst.exists() {
+            continue;
+        }
+        emit(app, "downloading", 0, 0, &format!("Downloading {name}"));
+        let resp = client.get(*url).send().await?.error_for_status()?;
+        let bytes = resp.bytes().await?;
+        std::fs::write(&dst, bytes).with_context(|| format!("writing {}", dst.display()))?;
+    }
+    Ok(dir)
 }
