@@ -107,9 +107,17 @@ async fn run_diarization(wav: &Path, models: &Path) -> Result<Vec<Segment>> {
         .join("sherpa-onnx-pyannote-segmentation-3-0")
         .join("model.onnx");
     let speaker = models.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
+    // The actual CLI flags use dotted namespacing
+    // (--segmentation.pyannote-model, --embedding.model). Without
+    // --clustering.num-clusters, the binary falls back to threshold
+    // clustering at 0.5 (the default), which works for unknown
+    // speaker counts.
     let out = Command::new(&bin)
-        .arg(format!("--segmentation-model={}", segmentation.display()))
-        .arg(format!("--embedding-model={}", speaker.display()))
+        .arg(format!(
+            "--segmentation.pyannote-model={}",
+            segmentation.display()
+        ))
+        .arg(format!("--embedding.model={}", speaker.display()))
         .arg(wav)
         .output()
         .await
