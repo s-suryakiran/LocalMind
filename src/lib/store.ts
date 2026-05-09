@@ -114,6 +114,15 @@ interface AppState {
   setSynapseWorkerPort: (port: number) => void;
   setSynapseWorkers: (workers: SynapseWorker[]) => void;
   setSynapseHostWeight: (weight: number | undefined) => void;
+
+  // Plan 3 voice diarization. `voiceEngineOverride` is persisted; the
+  // null default means "auto-pick by runtime" (sherpa on Tauri,
+  // web-speech in PWA). `transcripts` is in-memory only — not worth
+  // persisting full audio blobs through localStorage.
+  voiceEngineOverride: import("./types").VoiceEngineKind | null;
+  setVoiceEngineOverride: (v: import("./types").VoiceEngineKind | null) => void;
+  transcripts: import("./types").VoiceTranscript[];
+  addTranscript: (t: import("./types").VoiceTranscript) => void;
 }
 
 const emptyLlama: LlamaStatus = {
@@ -246,6 +255,11 @@ export const useApp = create<AppState>()(
         set((s) => ({ synapse: { ...s.synapse, workers } })),
       setSynapseHostWeight: (hostWeight) =>
         set((s) => ({ synapse: { ...s.synapse, hostWeight } })),
+
+      voiceEngineOverride: null,
+      setVoiceEngineOverride: (voiceEngineOverride) => set({ voiceEngineOverride }),
+      transcripts: [],
+      addTranscript: (t) => set((s) => ({ transcripts: [t, ...s.transcripts].slice(0, 50) })),
     }),
     {
       name: "localmind-store",
@@ -276,6 +290,7 @@ export const useApp = create<AppState>()(
         sdImages: s.sdImages,
         connection: s.connection,
         synapse: s.synapse,
+        voiceEngineOverride: s.voiceEngineOverride,
       }),
     },
   ),

@@ -245,3 +245,19 @@ export interface SdProgress {
   total: number;
   message: string;
 }
+
+export interface VoiceTurn {
+  speaker: number;
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+export interface VoiceTranscript {
+  id: string;
+  sourcePath: string | null;
+  createdAt: number;
+  turns: VoiceTurn[];
+}
+
+export type VoiceEngineKind = "sherpa" | "web-speech";

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowUp, Square, Loader2, Boxes, ImagePlus, Mic, MicOff, Volume2, BookOpen, X, Menu,
+  ArrowUp, Square, Loader2, Boxes, ImagePlus, Mic, MicOff, Volume2, BookOpen, X, Menu, FileAudio,
 } from "lucide-react";
+import { AudioDropZone } from "../components/AudioDropZone";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -28,6 +29,7 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [showSources, setShowSources] = useState(false);
+  const [showDropZone, setShowDropZone] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -320,6 +322,26 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
               ))}
             </div>
           )}
+          {!remote && showDropZone && (
+            <div className="mb-2">
+              <AudioDropZone
+                onTranscript={(t) => {
+                  setShowDropZone(false);
+                  if (!conv) return;
+                  const transcriptText = t.turns
+                    .map((tu) => `[Speaker ${tu.speaker + 1}]: ${tu.text}`)
+                    .join("\n");
+                  const sysMsg: ChatMessage = {
+                    id: uid(),
+                    role: "system",
+                    content: `[transcript]\n${transcriptText}`,
+                    createdAt: Date.now(),
+                  };
+                  updateConversation(conv.id, { messages: [...conv.messages, sysMsg] });
+                }}
+              />
+            </div>
+          )}
           <div className="relative flex items-end gap-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-panel)] focus-within:border-[var(--color-accent)]/60 transition-colors">
             <input
               type="file"
@@ -329,6 +351,15 @@ export function Chat({ onOpenMenu }: { onOpenMenu?: () => void } = {}) {
               ref={fileInputRef}
               onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
             />
+            {!remote && (
+              <button
+                onClick={() => setShowDropZone((v) => !v)}
+                className="ml-1 mb-1.5 w-9 h-9 rounded-xl grid place-items-center text-[var(--color-text-muted)] hover:bg-[var(--color-panel-2)]"
+                title="Attach audio file"
+              >
+                <FileAudio size={16} />
+              </button>
+            )}
             {isVision && (
               <button
                 onClick={() => fileInputRef.current?.click()}
