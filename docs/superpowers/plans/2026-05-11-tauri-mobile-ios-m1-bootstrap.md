@@ -2,11 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Get a signed iOS build of LocalMind onto a real iPhone via TestFlight, hosting the existing React app inside WKWebView with no functional regressions on desktop.
+**Goal:** Get a locally-signed iOS build of LocalMind onto a real iPhone, hosting the existing React app inside WKWebView with no functional regressions on desktop.
 
 **Architecture:** Use the Tauri 2 mobile scaffolding already in `src-tauri/gen/apple/`. Add an `iOS` section to `tauri.conf.json`, layer in iOS-specific `Info.plist` entries (mic, camera, local network, ATS), create an iOS-only capability allow-list, scaffold a cfg-gated Rust module for future iOS-only commands, and validate the build chain end-to-end. No new product features in M1 — this milestone exists to de-risk the iOS pipeline before M2 (pairing & discovery) starts.
 
-**Tech Stack:** Tauri 2.x mobile (iOS target), Xcode 16+, Swift 5.9+, Rust (existing `src-tauri/` crate, `target_os = "ios"` cfg gates), React 19 (existing, unchanged), Apple Developer Program (paid).
+**Tech Stack:** Tauri 2.x mobile (iOS target), Xcode 16+, Swift 5.9+, Rust (existing `src-tauri/` crate, `target_os = "ios"` cfg gates), React 19 (existing, unchanged), **free Apple ID with Xcode "Personal Team" signing** (no paid Apple Developer Program for M1–M4).
+
+**Cost-deferral path (decided 2026-05-11):** This plan ships using free Xcode signing rather than a $99/yr Apple Developer Program account. Trade-offs accepted:
+- App expires every 7 days; reinstall via `npm run tauri ios dev` when it does.
+- Max 3 free-signed apps per device at a time.
+- No TestFlight, no App Store, no APNs push, no App Groups (share extension). The first three only become required at M5 (push) and M6 (App Store); the share extension belongs to M3 and will need an alternative IPC mechanism that doesn't require App Groups, OR will be deferred until you pay the $99 then.
 
 **Spec:** [`docs/superpowers/specs/2026-05-11-tauri-mobile-ios-parity-design.md`](../specs/2026-05-11-tauri-mobile-ios-parity-design.md), §5 ("iOS Surfaces & Build Pipeline") and §8 ("Phased Milestones") M1.
 
@@ -22,7 +27,7 @@
 - `src-tauri/capabilities/ios.json` — iOS-only Tauri capability allow-list
 - `src-tauri/src/ios/mod.rs` — iOS-only Rust module gate (empty in M1; populated by M2+)
 - `docs/ios-developer-setup.md` — written-down checklist for the manual Apple Developer Program steps (so anyone joining the project can do this once)
-- `.github/workflows/ios.yml` — GitHub Actions workflow for building and uploading TestFlight builds on push to `main` *(M1 stretch — falls through to manual upload if not done in M1)*
+- `.github/workflows/ios.yml` — GitHub Actions workflow *(DEFERRED until paid Apple Developer enrollment; documented in Task 10)*
 
 ### Modified
 
@@ -40,59 +45,81 @@
 
 ---
 
-## Task 1: Apple Developer Program Setup (manual, one-time)
+## Task 1: Xcode free-signing setup (manual, ~10 min)
 
-This task has **no code** and **no commit at the end** — it's external-system setup. But it is a hard prerequisite for every subsequent task in this plan, so it ships as Task 1.
+This task has **no code** and **no commit at the end** — it's a one-time Xcode configuration.
 
-**Files:**
-- Create: `docs/ios-developer-setup.md` (the only on-repo artifact for this task)
+You need a free Apple ID, full Xcode installed (App Store → Xcode), and your iPhone connected via USB. No paid Apple Developer Program.
 
-- [ ] **Step 1: Verify you do not already have an Apple Developer account.** Visit https://developer.apple.com/account/. If you're enrolled, skip ahead to Step 4.
+**Files:** None.
 
-- [ ] **Step 2: Enroll in the Apple Developer Program.** $99/year. Use your Apple ID (the one tied to your phone for TestFlight installs). The enrollment review takes 24–48 hours typically. **You cannot proceed past Task 4 until this completes.**
-
-- [ ] **Step 3: Once enrolled, capture your Team ID.** Visit https://developer.apple.com/account/#/membership. Copy the 10-character Team ID (looks like `ABCD1234EF`). You'll paste it into `tauri.conf.json` in Task 2.
-
-- [ ] **Step 4: Register the app's bundle identifier.** Visit https://developer.apple.com/account/resources/identifiers/list. Click `+`, choose **App IDs**, type **App**, continue.
-   - Description: `LocalMind`
-   - Bundle ID: **Explicit** → `com.localmind.app` (must match `tauri.conf.json` `identifier`)
-   - Capabilities to enable: leave defaults for now. M5 will add **Push Notifications** and **App Groups** when needed.
-   - Click Continue → Register.
-
-- [ ] **Step 5: Create a Development Provisioning Profile.** Visit https://developer.apple.com/account/resources/profiles/list. Click `+`, type **iOS App Development**, continue.
-   - App ID: `com.localmind.app`
-   - Certificates: select your Apple development certificate (Xcode will have created one in your Keychain when you first opened Xcode; if not, Xcode → Settings → Accounts → Add Apple ID → Manage Certificates → `+` → Apple Development).
-   - Devices: add your iPhone's UDID (find via Finder → connect phone → click device name once in the sidebar → the long string above Capacity).
-   - Name: `LocalMind Dev`
-   - Generate and download. Double-click the `.mobileprovision` to install it.
-
-- [ ] **Step 6: Create a Distribution Provisioning Profile.** Same flow, but choose **App Store** under Distribution.
-   - App ID: `com.localmind.app`
-   - Certificates: select your Apple Distribution certificate (create one via Xcode if missing).
-   - Name: `LocalMind Distribution`
-   - Generate, download, install.
-
-- [ ] **Step 7: Create the App Store Connect record.** Visit https://appstoreconnect.apple.com/apps. Click `+` → New App.
-   - Platform: iOS
-   - Name: `LocalMind`
-   - Primary Language: English (US)
-   - Bundle ID: `com.localmind.app`
-   - SKU: `localmind-ios` (any unique string)
-   - User Access: Full Access
-   - Submit. This record is what TestFlight uploads attach to.
-
-- [ ] **Step 8: Write `docs/ios-developer-setup.md`.** Document Steps 1–7 in your own words so this is reproducible for future contributors. Save the file, then:
+- [ ] **Step 1: Verify full Xcode is installed (not just Command Line Tools).**
 
 ```bash
-git add docs/ios-developer-setup.md
-git commit -m "docs(ios): add Apple Developer Program setup checklist"
+xcode-select -p
 ```
 
+Expected: a path ending in `/Xcode.app/Contents/Developer`. If you see `/Library/Developer/CommandLineTools`, install Xcode from the Mac App Store (~15 GB download), then run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
+
+- [ ] **Step 2: Sign into Xcode with your Apple ID.**
+
+Open Xcode → **Settings…** (or `Cmd-,`) → **Accounts** tab → click `+` in the lower-left → **Apple ID** → enter your Apple ID and password.
+
+After it loads, click your Apple ID on the left. You should see a "Personal Team" row appear under it with a 10-character team ID (looks like `ABCD1234EF`). Copy this Team ID — you'll need it for Task 2 if you haven't already filled in `tauri.conf.json`.
+
+Close Settings.
+
+- [ ] **Step 3: Capture the free Team ID for the project config.**
+
+You'll paste this into `src-tauri/tauri.conf.json` in Task 2 (which is already done, with a placeholder). Open `src-tauri/tauri.conf.json`, find the `"iOS"` block, replace `REPLACE_WITH_YOUR_TEAM_ID` with the 10-character Team ID from Step 2:
+
+```bash
+# After you have the Team ID from Xcode:
+sed -i '' 's/REPLACE_WITH_YOUR_TEAM_ID/YOUR_ACTUAL_TEAM_ID/' src-tauri/tauri.conf.json
+# Verify:
+grep developmentTeam src-tauri/tauri.conf.json
+```
+
+Expected: line shows `"developmentTeam": "ABCD1234EF"` (your real ID).
+
+Commit the change so future builds use the right team:
+
+```bash
+git add src-tauri/tauri.conf.json
+git commit -m "chore(ios): set free-signing Team ID"
+```
+
+(Note: your free Team ID is not particularly sensitive — it's used by Apple to identify which Apple ID signed a build, but it's not a credential. Committing it to a private repo is fine. For an open-source repo, consider using a `developmentTeam.local` file or an env var instead.)
+
+- [ ] **Step 4: Plug in your iPhone via USB and trust the Mac.**
+
+Unlock the phone, tap "Trust" when prompted, confirm with your passcode. Verify:
+
+```bash
+xcrun xctrace list devices 2>&1 | grep -i iphone | head -3
+```
+
+Expected: your iPhone listed with a UDID.
+
+- [ ] **Step 5: First-time device trust in Xcode (one-time).**
+
+In Xcode → **Window → Devices and Simulators** → select your iPhone in the sidebar. Wait while Xcode prepares the device for development (~30s the first time — it copies a debug symbol package). The status indicator goes from yellow to green when ready. Close the window.
+
 **Exit criteria for Task 1:**
-- You have a 10-character Team ID written down.
-- A `com.localmind.app` bundle identifier is registered in the developer portal.
-- Two provisioning profiles (`LocalMind Dev` + `LocalMind Distribution`) are installed on your machine.
-- A `LocalMind` app record exists in App Store Connect.
+- `xcode-select -p` returns the Xcode.app Developer path
+- Your Apple ID is signed into Xcode with a "Personal Team" visible
+- Your real 10-character Team ID is committed in `src-tauri/tauri.conf.json` (replacing the placeholder)
+- Your iPhone shows up in Xcode's Devices window with a green status
+- You're ready to do Tasks 6–9 (build + install) any time
+
+**What you DO NOT have (intentional, per cost-deferral path):**
+- $99 Apple Developer Program membership
+- A registered `com.localmind.app` bundle identifier in the developer portal — Xcode auto-resolves to a wildcard provisioning profile for free signing
+- Distribution provisioning profile
+- An App Store Connect record
+- The ability to use TestFlight, App Store, APNs push, or App Groups
+
+These all gate on the paid account. When you reach M5 (push) or M6 (store), enroll then.
 
 ---
 
@@ -512,7 +539,11 @@ open src-tauri/gen/apple/localmind.xcodeproj
 
 Wait for Xcode to finish indexing (status bar in the top center). Verify:
 - The `localmind_iOS` scheme appears in the scheme picker (top-left, next to the play button).
-- Under Targets → `localmind_iOS` → **Signing & Capabilities**: the Team is set to your Apple Developer team (auto-populated from `tauri.conf.json`). If empty, click the Team dropdown and pick your team.
+- Under Targets → `localmind_iOS` → **Signing & Capabilities**:
+  - **Automatically manage signing** — checked.
+  - **Team** — pick your "Personal Team" (the one tied to your free Apple ID; same Team ID you put in `tauri.conf.json`).
+  - **Bundle Identifier** — should read `com.localmind.app`.
+  - **Provisioning Profile** — should show "Xcode Managed Profile" (no error). If you see a red banner ("Failed to register bundle identifier" or "No profiles found"), that's expected on the first build attempt — proceed to Task 7 and let Xcode auto-resolve. If it doesn't resolve after a build attempt, try changing the Bundle Identifier to something unique (e.g. `com.localmind.app.<your-initials>`) — free-tier wildcard provisioning sometimes conflicts with previously-used bundle IDs.
 
 Close Xcode when done (you don't need to build from inside Xcode — Tauri's CLI drives it).
 
@@ -585,72 +616,67 @@ Real errors to fix: anything mentioning `Info.plist`, `entitlements`, `capabilit
 
 ---
 
-## Task 8: First release IPA build (device, signed)
+## Task 8: First device build via free signing
 
-**Context:** Build a signed `.ipa` that can be installed on a physical device via TestFlight. This validates the full signing pipeline before we hand off to TestFlight in Task 9.
+**Context:** Install LocalMind on your physical iPhone using free Xcode signing. No `.ipa` archive needed — we use Tauri's dev workflow which auto-installs to the connected device. The build is debug-mode (not release-mode), which is fine for personal-device testing.
 
 **Files:** None modified.
 
-- [ ] **Step 1: Plug in your iPhone via USB and trust it.** Unlock the phone, trust the Mac when prompted. Verify it appears:
+- [ ] **Step 1: Verify Task 1 prerequisites are done.** Your iPhone is plugged in, trusted, and visible:
 
 ```bash
 xcrun xctrace list devices 2>&1 | grep -i iphone | head -3
 ```
 
-Expected: your iPhone listed with a UDID. If not, check the cable / unlock state.
+Expected: your iPhone listed with a UDID.
 
-- [ ] **Step 2: Open Xcode and verify signing.**
+- [ ] **Step 2: Verify Xcode signing config one last time.**
 
 ```bash
 open src-tauri/gen/apple/localmind.xcodeproj
 ```
 
 In Xcode → Targets → `localmind_iOS` → Signing & Capabilities:
-- "Automatically manage signing" — check it.
-- Team — set to your Apple Developer team.
-- Bundle Identifier — confirm `com.localmind.app`.
-- Provisioning Profile — should auto-resolve to `LocalMind Dev` for Debug and `LocalMind Distribution` for Release. If it shows red errors, click "Try Again" or set them manually (Build Settings → Signing → "Provisioning Profile" rows).
+- "Automatically manage signing" — checked.
+- Team — your Personal Team.
+- Bundle Identifier — `com.localmind.app` (if it errors, change to `com.localmind.app.<your-initials>` to dodge bundle-ID collisions on the free wildcard provisioning).
+- Provisioning Profile — should resolve to "Xcode Managed Profile". If it shows a red banner, click "Try Again" and wait for Xcode to talk to Apple.
 
 Close Xcode.
 
-- [ ] **Step 3: Build the release IPA.**
+- [ ] **Step 3: Run the dev build pointed at your phone.**
 
 ```bash
-npm run tauri ios build -- --target aarch64-apple-ios
+npm run tauri ios dev
 ```
 
-This takes 10–20 min on M1 Pro (Rust release build + Xcode archive + IPA pack). Output location at end: `src-tauri/gen/apple/build/arm64/LocalMind.ipa` (path may vary; Tauri prints it).
+When prompted "Detected connected device. Launch on it?" — answer **y**. (Or pass `--host` and a specific device ID; see `tauri ios dev --help`.)
 
-- [ ] **Step 4: Confirm the IPA exists and is signed.**
+The first build takes 10–20 min on M1 Pro (full Rust debug build for iOS + Swift compile + signing + install). Subsequent builds are 30s–2 min thanks to Cargo's incremental compilation.
 
-```bash
-find src-tauri/gen/apple/build -name "*.ipa" -mtime -1
-```
+When the build finishes, the app launches automatically on your iPhone.
 
-Expected: a path to the just-built `.ipa`. Then verify it's signed:
+- [ ] **Step 4: Handle the "Untrusted Developer" prompt (one-time per Apple ID).**
 
-```bash
-unzip -p $(find src-tauri/gen/apple/build -name "*.ipa" -mtime -1 | head -1) Payload/LocalMind.app/_CodeSignature/CodeResources | head -5
-```
+If the app fails to launch with "Untrusted Developer", that's normal for the first install:
+- iPhone: Settings → General → VPN & Device Management → tap your Apple ID under DEVELOPER APP → Trust "Apple Development: yourname@yourdomain" → Trust.
+- Re-launch the app from the home screen.
 
-Expected: XML content (the signature manifest). If `unzip` complains "no such file", the app inside the IPA is unsigned and signing failed in Step 3 — re-check Xcode signing settings.
+- [ ] **Step 5: Verify the app launches and the Connect screen renders.**
 
-- [ ] **Step 5: Verify the embedded Info.plist contains the keys from Task 3.**
+Look for the LocalMind home screen icon. Tap to open. The Connect screen should appear (PIN entry, QR scan area, etc.) — same as the existing PWA experience because we're hosting the same React bundle inside WKWebView.
 
-```bash
-IPA=$(find src-tauri/gen/apple/build -name "*.ipa" -mtime -1 | head -1)
-unzip -p "$IPA" Payload/LocalMind.app/Info.plist | plutil -convert xml1 -o - - | grep -E "NSMicrophone|NSCamera|NSLocalNetwork|NSBonjourServices|NSAppTransportSecurity"
-```
+DON'T attempt to actually pair yet — M2 hasn't built the discovery flow. We're only validating that the React bundle ships and renders on the device.
 
-Expected: at least one line for each of the five keys you added. If any are missing, Tauri's build didn't pick them up from `gen/apple/.../Info.plist` — re-check Task 3 (file path correct?) and rebuild.
+- [ ] **Step 6: Check the iOS console for errors.**
 
-- [ ] **Step 6: Install the IPA on your phone via Xcode Devices window.**
+The terminal running `npm run tauri ios dev` streams device logs. Look for any RED error lines.
 
-In Xcode: Window → Devices and Simulators → select your iPhone → drag the `.ipa` from Finder onto the "Installed Apps" list. Wait for install to complete (~30s).
+Common harmless warnings: `WKWebView did fail navigation` (for non-existent endpoints during initial load), `App Transport Security has blocked` (for any non-local URLs the app tries to reach in code paths we haven't excluded yet).
 
-- [ ] **Step 7: Launch LocalMind on your phone.** First launch will:
-- Show "Untrusted Developer" the first time. Fix: Settings → General → VPN & Device Management → tap your Apple ID under DEVELOPER APP → Trust.
-- Re-launch. Connect screen should appear.
+Real errors to fix: anything mentioning `Info.plist`, `entitlements`, `capability`, `Tauri command not found`, `bridge`, or panics from Rust code.
+
+- [ ] **Step 7: Stop the dev session.** Hit Ctrl-C in the terminal. The app stays installed on your phone (it just stops live-reloading). You can re-launch it from the home screen any time within 7 days; after that, re-run `npm run tauri ios dev` to re-sign and re-install.
 
 - [ ] **Step 8: Commit any incidental changes from Xcode opening the project.**
 
@@ -658,71 +684,51 @@ In Xcode: Window → Devices and Simulators → select your iPhone → drag the 
 git status src-tauri/gen/apple/
 # If anything changed:
 git add src-tauri/gen/apple/
-git commit -m "chore(ios): xcode signing settings auto-update"
+git commit -m "chore(ios): xcode auto-managed signing settings"
+# Otherwise:
+echo "no changes — proceed"
 ```
 
-**Exit criteria for Task 8:** LocalMind launches on your physical iPhone with no install or runtime crash, displaying the Connect screen.
+**Exit criteria for Task 8:** LocalMind launches on your physical iPhone via free Xcode signing, with no install or runtime crash, displaying the Connect screen.
+
+**This is the M1 deliverable for the free-signing path.** Task 9 (TestFlight) is deferred to M5/M6 when you pay the $99. Task 10 (CI) is similarly deferred.
 
 ---
 
-## Task 9: First TestFlight upload
+## Task 9 (deferred): First TestFlight upload
 
-**Context:** TestFlight is the App Store's beta-distribution channel and the staging area for App Store releases. Uploading once now validates the App Store Connect integration before M6's actual store submission.
+**Status: DEFERRED until you pay the $99 Apple Developer Program fee** (likely at M5 or M6).
 
-**Files:** None modified.
+TestFlight is the App Store's beta distribution channel. It requires a paid Apple Developer Program membership, a Distribution provisioning profile, and an App Store Connect record — none of which the free-signing path provides.
 
-- [ ] **Step 1: Verify your release IPA is up to date.** Use the one built in Task 8, or rebuild:
+When you do enroll, this task becomes:
+1. Generate an App Store Connect API key.
+2. Rebuild with a Distribution signing identity (`npm run tauri ios build -- --target aarch64-apple-ios`).
+3. Upload the `.ipa` via `xcrun altool --upload-app`.
+4. Wait for processing in App Store Connect.
+5. Install via TestFlight on your phone.
 
-```bash
-ls -lt src-tauri/gen/apple/build/*/LocalMind.ipa 2>/dev/null | head -1
-```
+Full steps are preserved in version control history of this plan (pre-deferral revision). Don't worry about them now — focus on getting M2–M4 working with free signing first.
 
-If older than your latest commit, rebuild with `npm run tauri ios build -- --target aarch64-apple-ios`.
-
-- [ ] **Step 2: Generate an App Store Connect API key (one-time).**
-
-Visit https://appstoreconnect.apple.com/access/integrations/api → Generate API Key. Name: `LocalMind CLI`. Access: `Developer`. Download the `.p8` file (you can only download it once — save it to `~/.appstoreconnect/AuthKey_<KEY_ID>.p8`).
-
-Note the Key ID (10 chars) and Issuer ID (a UUID, shown on the API Keys page).
-
-- [ ] **Step 3: Upload via `xcrun altool`.**
+**M1 ships at the end of Task 8** under the free-signing path. Tag the completion when you finish Task 8:
 
 ```bash
-IPA=$(find src-tauri/gen/apple/build -name "*.ipa" -mtime -1 | head -1)
-xcrun altool --upload-app \
-  --type ios \
-  --file "$IPA" \
-  --apiKey YOUR_KEY_ID \
-  --apiIssuer YOUR_ISSUER_ID
+git tag -a m1-ios-bootstrap-complete -m "M1 ships: first free-signed iOS build of LocalMind installed on personal device"
 ```
 
-Expected output ends with `UPLOAD SUCCEEDED`. The upload takes 5–15 min depending on bandwidth. If it fails with `Invalid binary`, read the error — common causes: missing privacy strings (Task 3 not done), wrong Team ID in provisioning profile (Task 1 Step 5/6 mismatch).
-
-- [ ] **Step 4: Wait for App Store Connect to process the build.** Visit https://appstoreconnect.apple.com/apps → LocalMind → TestFlight tab. The new build appears with status "Processing" (~10–30 min) → "Ready to Submit" or "Missing Compliance".
-
-If "Missing Compliance", click into the build and answer the export-compliance questions (LocalMind doesn't use proprietary encryption — answer **No** to "Does your app use encryption?" then **Yes** to "Does your app qualify for any exemptions?" → **Yes** to "Your app uses encryption only in ways exempt from export compliance").
-
-- [ ] **Step 5: Install via TestFlight on your phone.**
-
-Open TestFlight on your iPhone (install from App Store if you don't have it). Tap `+` next to LocalMind → install. The "Untrusted Developer" prompt does NOT appear — TestFlight builds are pre-trusted.
-
-Launch LocalMind. Connect screen appears, just like in Task 8 but now via the production-grade install path.
-
-- [ ] **Step 6: Tag and commit a marker for M1 completion.**
-
-```bash
-git tag -a m1-ios-bootstrap-complete -m "M1 ships: first TestFlight build of LocalMind iOS"
-```
-
-**Exit criteria for Task 9 (and M1 overall):** LocalMind is installed on your physical iPhone via TestFlight and displays the Connect screen.
+**Exit criteria for M1 (free-signing path):** LocalMind is installed on your physical iPhone via free Xcode signing and displays the Connect screen (Task 8 exit criteria).
 
 ---
 
-## Task 10 (stretch): GitHub Actions CI for TestFlight uploads
+## Task 10 (deferred): GitHub Actions CI for TestFlight uploads
 
-**Context:** Up to Task 9 we've been uploading manually. Automating it on push-to-`main` means M2–M6 development gets continuous TestFlight builds without thinking about it.
+**Status: DEFERRED.** CI uploads to TestFlight require a paid Distribution signing certificate and TestFlight access — both gated by the $99 enrollment. Revisit when you pay.
 
-**This task is M1 stretch.** If Tasks 1–9 took the full week, ship M1 without it and revisit in M2.
+Free-signing builds cannot be meaningfully automated in CI either: a free-tier provisioning profile is tied to a specific machine's Keychain and re-signed every 7 days. There's no way to ship a free-signed `.ipa` from CI to your phone.
+
+For now, your "CI" is `npm run tauri ios dev` on your laptop, run weekly when the previous build expires. That's the cost of deferring the $99.
+
+When you do enroll, the original CI workflow (preserved below for reference) becomes viable.
 
 **Files:**
 - Create: `.github/workflows/ios.yml`
@@ -846,43 +852,49 @@ Iterate as needed. Each fix is a small commit + push to re-trigger.
 
 ## Spec coverage check
 
-Mapping spec §8 M1 exit criteria to plan tasks:
+Mapping spec §8 M1 exit criteria to plan tasks (free-signing path):
 
-- "Apple Developer setup" → Task 1 ✓
+- "Apple Developer setup" → Task 1 (now free Xcode signing, not paid enrollment) ✓
 - "`tauri ios init` already done, fix capabilities + Info.plist additions" → Tasks 3, 4 ✓
-- "first signed TestFlight build that launches WKWebView and shows existing Connect screen" → Tasks 8, 9 ✓
-- "Exit criteria: you can install via TestFlight on your phone and see the React app" → Task 9 Step 5 ✓
+- "first build that launches WKWebView and shows existing Connect screen" → Task 8 ✓ (TestFlight removed from criteria; install path is direct device install via free signing)
+- "Exit criteria: you can install on your phone and see the React app" → Task 8 Step 5 ✓
 
 Mapping spec §5 ("Bundle layout", "Native modules", "Info.plist additions") subset that M1 must cover:
 
-- Main `LocalMind.app` bundle ID `com.localmind.app` → Task 1 Step 4 ✓
+- Main `LocalMind.app` bundle ID `com.localmind.app` (or `.<your-initials>` if free wildcard collides) → Task 1, Task 8 ✓
 - iOS minimum 15.0 → Task 2 ✓
 - All five Info.plist privacy/ATS keys → Task 3 ✓
 - iOS-only Rust module skeleton → Task 5 ✓
-- `npm run tauri ios build --release` pipeline → Task 8 ✓
-- CI / TestFlight automation → Task 10 (stretch) ✓
+- `npm run tauri ios dev` device install pipeline → Task 8 ✓
 
 Deferred to later milestones (correctly out of M1 scope):
 
 - Native Swift modules (QR, mDNS, Keychain, etc.) → M2/M3/M4/M5
-- Share extension target → M3
-- `apns_pusher` Rust crate → M5
+- Share extension target → M3 *(also needs paid account — App Groups; M3 plan must either drop the share extension or include the $99 enrollment)*
+- `apns_pusher` Rust crate → M5 *(needs paid account)*
 - Server-side endpoints (`/api/pair/apns`, `/api/chats/{id}/resume`) → M4/M5
 - Mobile UI breakpoints → M3
-- Privacy manifest + App Store metadata → M6
+- Privacy manifest + App Store metadata → M6 *(needs paid account)*
 
-No spec requirement is silently dropped.
+Deferred specifically because of the cost-deferral path:
+
+- TestFlight upload pipeline → Task 9 (deferred until paid enrollment)
+- GitHub Actions CI for builds → Task 10 (deferred until paid enrollment)
+
+No spec requirement is silently dropped — the spec assumed paid account, this plan honors the cost-deferral decision while preserving every spec-listed feature for future implementation.
 
 ---
 
-## What ships after this plan
+## What ships after this plan (free-signing path)
 
-After Task 9 completes:
+After Task 8 completes:
 
-- A signed LocalMind iOS app is installable via TestFlight on your iPhone.
+- A locally-signed LocalMind iOS app is installed on your iPhone via Xcode "Personal Team" signing.
 - It hosts the existing React UI inside WKWebView and shows the Connect screen.
+- The app must be reinstalled every 7 days (free signing limitation) — `npm run tauri ios dev` handles this.
 - It does NOT yet pair with the desktop (no QR scanner, no mDNS browser — that's M2).
 - It does NOT yet have the native polish (no FaceID, no share extension, no mobile breakpoints — that's M3).
+- It does NOT push notifications, App Store presence, or share extension (those need M5/M6 + paid account).
 - The build pipeline is validated end-to-end, so M2 starts on a known-good baseline.
 
 After Task 10 (if completed):
