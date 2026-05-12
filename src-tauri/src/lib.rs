@@ -16,6 +16,8 @@ mod synapse_tls;
 mod synapse_token;
 mod voice;
 mod voice_audio;
+#[cfg(target_os = "ios")]
+mod ios;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
 use models::{InstalledModel, ModelKind, ModelListing};
@@ -551,6 +553,8 @@ pub fn run() {
             voice_transcribe_file,
             ensure_voice_engine,
             voice_save_recording,
+            #[cfg(target_os = "ios")]
+            ios::ios_bridge_version,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
