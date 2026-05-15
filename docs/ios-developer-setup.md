@@ -75,7 +75,22 @@ xcrun xctrace list devices 2>&1 | grep -i iphone | head -3
 
 In Xcode → **Window → Devices and Simulators** → select your iPhone in the sidebar; wait for the status dot to go yellow → green (~30 s the first time).
 
-## 6. Build
+## 6. Regenerate the gitignored Xcode project files (fresh clone only)
+
+`src-tauri/gen/apple/localmind.xcodeproj/project.pbxproj` and `src-tauri/gen/apple/localmind.xcodeproj/xcshareddata/xcschemes/localmind_iOS.xcscheme` are gitignored — they're rewritten by Xcode and Tauri on every build (which would leak the Team ID into the public repo and produce constant noisy diffs). On a fresh clone you'll need to regenerate them once from `src-tauri/gen/apple/project.yml`.
+
+```bash
+brew install xcodegen
+cd src-tauri/gen/apple
+xcodegen generate
+cd -
+```
+
+This reads `project.yml` and produces only the two gitignored files. It will not touch any of the other tracked files in `src-tauri/gen/apple/` (Info.plist, entitlements, source files, assets).
+
+If `xcodegen` isn't available, `npm run tauri ios init` will also regenerate them — but it may also re-create other parts of `gen/apple/` from scratch, potentially overwriting customizations (Info.plist privacy keys, etc.). Prefer `xcodegen generate` when possible; back up the directory if you use `tauri ios init`.
+
+## 7. Build
 
 Two convenience scripts are wired up in `package.json`:
 
