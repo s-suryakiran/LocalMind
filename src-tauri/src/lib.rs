@@ -3,6 +3,8 @@ mod binaries;
 mod config;
 mod hardware;
 mod host_proxy;
+#[cfg(target_os = "ios")]
+mod ios;
 mod llama;
 mod models;
 mod rag;
@@ -16,8 +18,6 @@ mod synapse_tls;
 mod synapse_token;
 mod voice;
 mod voice_audio;
-#[cfg(target_os = "ios")]
-mod ios;
 
 use llama::{LlamaSettings, LlamaState, LlamaStatus};
 use models::{InstalledModel, ModelKind, ModelListing};
