@@ -38,6 +38,10 @@
     "macOS": {
       "minimumSystemVersion": "10.15",
       "infoPlist": "Info.macos.plist"
+    },
+    "iOS": {
+      "developmentTeam": "REPLACE_WITH_YOUR_TEAM_ID",
+      "minimumSystemVersion": "15.0"
     }
   }
 }

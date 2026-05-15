@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "ios",
+  "description": "Capability for the main window (iOS)",
+  "platforms": ["iOS"],
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:app:default",
+    "dialog:default",
+    "store:default"
+  ]
+}

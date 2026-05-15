@@ -4,7 +4,7 @@
 # Tauri-generated mobile scaffolding and capability schemas
 /gen/schemas
 /gen/android
-/gen/apple
+# /gen/apple is tracked (project source: Xcode project, Swift entry point, Info.plist, assets)
 
 # Bundled installers
 /release/

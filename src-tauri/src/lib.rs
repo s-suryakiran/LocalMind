@@ -3,6 +3,8 @@ mod binaries;
 mod config;
 mod hardware;
 mod host_proxy;
+#[cfg(target_os = "ios")]
+mod ios;
 mod llama;
 mod models;
 mod rag;
@@ -551,6 +553,8 @@ pub fn run() {
             voice_transcribe_file,
             ensure_voice_engine,
             voice_save_recording,
+            #[cfg(target_os = "ios")]
+            ios::ios_bridge_version,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
