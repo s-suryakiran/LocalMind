@@ -477,7 +477,7 @@ Expected: `0 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out`. The `ios
 mod ios;
 ```
 
-Place it alongside the other `mod` declarations (e.g. near `mod voice;`, `mod voice_audio;`).
+Place it in **alphabetical order** with the other `mod` declarations — between `mod host_proxy;` and `mod llama;`. rustfmt enforces strict alphabetical ordering for module declarations even with `#[cfg(...)]` attributes, so don't append it at the end of the block (CI will fail `cargo fmt --all -- --check`).
 
 Then find the `invoke_handler` call (likely in the `run()` function in `lib.rs`) — it'll look like:
 
