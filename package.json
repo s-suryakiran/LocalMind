@@ -10,6 +10,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "ios:dev": "tauri ios dev --config src-tauri/tauri.ios.local.conf.json",
+    "ios:build": "tauri ios build --config src-tauri/tauri.ios.local.conf.json",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
     "typecheck": "tsc --noEmit",

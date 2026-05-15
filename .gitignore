@@ -32,6 +32,9 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Per-developer Tauri config overrides (e.g. iOS free-signing Team ID)
+src-tauri/tauri.*.local.conf.json
+
 # Local model and binary caches (in case anything escapes ~/Library)
 *.gguf
 *.safetensors

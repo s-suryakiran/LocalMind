@@ -26,16 +26,17 @@
 - `src-tauri/Info.ios.plist` — iOS-only Info.plist key additions, merged by Tauri at build time
 - `src-tauri/capabilities/ios.json` — iOS-only Tauri capability allow-list
 - `src-tauri/src/ios/mod.rs` — iOS-only Rust module gate (empty in M1; populated by M2+)
-- `docs/ios-developer-setup.md` — written-down checklist for the manual Apple Developer Program steps (so anyone joining the project can do this once)
+- `src-tauri/tauri.ios.local.conf.json` — **gitignored** per-developer Tauri config override that injects the free-signing Team ID at build time. Each contributor creates their own (see `docs/ios-developer-setup.md`); never committed because (a) the repo is public and (b) each contributor has their own free Team ID.
+- `docs/ios-developer-setup.md` — written-down setup checklist (Xcode install, Apple ID sign-in, Team ID extraction, local override file creation, device trust) so anyone joining the project can do this once
 - `.github/workflows/ios.yml` — GitHub Actions workflow *(DEFERRED until paid Apple Developer enrollment; documented in Task 10)*
 
 ### Modified
 
-- `src-tauri/tauri.conf.json` — add `bundle.iOS` section (development team, min iOS version, simulator vs device build targets)
+- `src-tauri/tauri.conf.json` — add `bundle.iOS` section (placeholder development team `REPLACE_WITH_YOUR_TEAM_ID`, min iOS version 15.0). The real Team ID is supplied per-developer via the gitignored `tauri.ios.local.conf.json` override.
 - `src-tauri/src/lib.rs` — wire `#[cfg(target_os = "ios")] mod ios;`
-- `package.json` — convenience scripts (`ios:dev`, `ios:build`) wrapping the underlying `tauri ios` commands
-- `README.md` — extend the "Going fully native (Tauri Mobile)" section with concrete commands and prerequisites
-- `.gitignore` — Xcode-derived data, fastlane temp files, signing secrets
+- `package.json` — convenience scripts (`ios:dev`, `ios:build`) that pass `--config src-tauri/tauri.ios.local.conf.json` to merge in the per-developer Team ID at build time
+- `README.md` — extend the "Going fully native (Tauri Mobile)" section with concrete commands and prerequisites, link to `docs/ios-developer-setup.md`
+- `.gitignore` — ignore `src-tauri/tauri.*.local.conf.json` (per-developer Tauri overrides), plus Xcode-derived data, fastlane temp files, signing secrets
 
 ### Untouched in M1
 
@@ -69,27 +70,41 @@ After it loads, click your Apple ID on the left. You should see a "Personal Team
 
 Close Settings.
 
-- [ ] **Step 3: Capture the free Team ID for the project config.**
+- [ ] **Step 3: Capture the free Team ID and put it in your local Tauri override file.**
 
-You'll paste this into `src-tauri/tauri.conf.json` in Task 2 (which is already done, with a placeholder). Open `src-tauri/tauri.conf.json`, find the `"iOS"` block, replace `REPLACE_WITH_YOUR_TEAM_ID` with the 10-character Team ID from Step 2:
+This repo is public and each contributor uses their own free Team ID, so the Team ID is **not** committed. Instead, it lives in a gitignored per-developer override file that Tauri 2 merges in at build time via the `--config` flag.
 
-```bash
-# After you have the Team ID from Xcode:
-sed -i '' 's/REPLACE_WITH_YOUR_TEAM_ID/YOUR_ACTUAL_TEAM_ID/' src-tauri/tauri.conf.json
-# Verify:
-grep developmentTeam src-tauri/tauri.conf.json
+Create `src-tauri/tauri.ios.local.conf.json` (filename is matched by the `src-tauri/tauri.*.local.conf.json` rule in `.gitignore`):
+
+```json
+{
+  "bundle": {
+    "iOS": {
+      "developmentTeam": "ABCD1234EF"
+    }
+  }
+}
 ```
 
-Expected: line shows `"developmentTeam": "ABCD1234EF"` (your real ID).
+Replace `ABCD1234EF` with your real 10-character Team ID from Step 2.
 
-Commit the change so future builds use the right team:
+Verify it parses:
 
 ```bash
-git add src-tauri/tauri.conf.json
-git commit -m "chore(ios): set free-signing Team ID"
+python3 -m json.tool src-tauri/tauri.ios.local.conf.json > /dev/null && echo OK
 ```
 
-(Note: your free Team ID is not particularly sensitive — it's used by Apple to identify which Apple ID signed a build, but it's not a credential. Committing it to a private repo is fine. For an open-source repo, consider using a `developmentTeam.local` file or an env var instead.)
+Expected: `OK`.
+
+Verify it's gitignored (should print nothing):
+
+```bash
+git status --porcelain src-tauri/tauri.ios.local.conf.json
+```
+
+No commit at this step — the file is intentionally untracked. The npm scripts `ios:dev` / `ios:build` (wired up in Task 2) pass `--config src-tauri/tauri.ios.local.conf.json` so the Team ID is merged into the build.
+
+(Background: a free Personal Team ID is technically not a credential — it's embedded in every signed binary — but for a public repo we keep it out of the tree to avoid linking the repo to one developer's Apple ID identity and to make it obvious that contributors must use their own Team IDs. For a private repo or single-developer use, committing the Team ID directly into `tauri.conf.json` is fine.)
 
 - [ ] **Step 4: Plug in your iPhone via USB and trust the Mac.**
 
@@ -136,7 +151,7 @@ cat src-tauri/tauri.conf.json
 
 Note the existing `bundle` section has `active`, `targets`, `icon`, `resources`, `macOS`. We're adding a peer `iOS` key.
 
-- [ ] **Step 2: Add the iOS bundle section.** Insert a new `"iOS"` key under `"bundle"`, immediately after the existing `"macOS"` key. The Team ID is the value you captured in Task 1, Step 3.
+- [ ] **Step 2: Add the iOS bundle section.** Insert a new `"iOS"` key under `"bundle"`, immediately after the existing `"macOS"` key.
 
 Find the section that looks like:
 
@@ -158,7 +173,7 @@ Add this peer key:
     }
 ```
 
-Replace `REPLACE_WITH_YOUR_TEAM_ID` with your actual Team ID from Task 1 Step 3.
+The placeholder `REPLACE_WITH_YOUR_TEAM_ID` is intentional and **stays in the committed file** — the real Team ID lives in a per-developer gitignored override file (`src-tauri/tauri.ios.local.conf.json`, created in Task 1 Step 3) that Tauri merges in at build time via the `--config` flag wired up by the `ios:dev` / `ios:build` npm scripts in Task 2 Step 6.
 
 - [ ] **Step 3: Validate the JSON parses.**
 
@@ -188,6 +203,41 @@ cd src-tauri && cargo check --target aarch64-apple-ios 2>&1 | head -20
 ```bash
 git add src-tauri/tauri.conf.json
 git commit -m "feat(ios): add iOS bundle config to tauri.conf.json"
+```
+
+- [ ] **Step 6: Wire `ios:dev` / `ios:build` npm scripts that merge in the per-developer Team ID.**
+
+These scripts pass `--config src-tauri/tauri.ios.local.conf.json` to the underlying `tauri ios` CLI, so each developer's gitignored override file (from Task 1 Step 3) supplies the real Team ID at build time.
+
+Edit `package.json` and add two entries to `scripts`, just under the existing `"tauri": "tauri"` line:
+
+```json
+    "ios:dev": "tauri ios dev --config src-tauri/tauri.ios.local.conf.json",
+    "ios:build": "tauri ios build --config src-tauri/tauri.ios.local.conf.json",
+```
+
+Also add the gitignore rule that keeps every developer's override out of the tree. In the root `.gitignore`, under the existing "Environment / secrets" block, add:
+
+```
+# Per-developer Tauri config overrides (e.g. iOS free-signing Team ID)
+src-tauri/tauri.*.local.conf.json
+```
+
+Verify the gitignore is working — your local override file from Task 1 Step 3 should not appear in `git status`:
+
+```bash
+git status --porcelain src-tauri/tauri.ios.local.conf.json
+```
+
+Expected: nothing. (If you see the file listed, the gitignore rule isn't matching — check spelling.)
+
+Finally, write the per-developer onboarding doc (`docs/ios-developer-setup.md`) that walks future contributors through the Xcode install, Apple ID sign-in, Team ID extraction, local override creation, and device trust. This is the document a new contributor reads once when they first build for iOS. (Content: roughly the Task 1 + Task 7/8 manual steps, distilled into a 5-step checklist.)
+
+Then commit:
+
+```bash
+git add package.json .gitignore docs/ios-developer-setup.md
+git commit -m "feat(ios): per-developer Team ID via gitignored tauri.ios.local.conf.json"
 ```
 
 ---
