@@ -952,3 +952,17 @@ After Task 10 (if completed):
 - Every push to `main` produces a TestFlight build automatically.
 
 The next plan to write: `docs/superpowers/plans/<date>-tauri-mobile-ios-m2-pairing.md`, written when this plan completes so it reflects what we actually learned during M1.
+
+---
+
+## Discovered during M1 — track for M2+
+
+Items surfaced while executing this plan that aren't M1 scope but must not be lost when the next plans are written.
+
+- **Back navigation missing on iOS (M2/M3).** The React app uses Zustand state-based view switching (no React Router / no browser history), and iOS has no hardware back button. Result: once a user navigates into Settings, model detail, or any sub-view, there is no way out except restarting the app. M2's pairing flow (multi-step: QR scan → PIN → confirm) will feel this acutely. Two options to evaluate when M2 lands:
+  1. Add explicit per-view back buttons in the React UI (mobile-only via breakpoint), feeding a "previous view" stack the Zustand store maintains. Lowest-risk; works the same on iOS and Android.
+  2. Migrate the React app to URL-based routing (React Router or TanStack Router), enable `WKWebView.allowsBackForwardNavigationGestures = true` in the iOS shell, and let iOS's edge-swipe gesture handle back. More invasive; touches desktop too.
+  Recommend (1) for M2 (pairing-flow-only), defer (2) to M3 if/when mobile polish demands it.
+- **Stale keychain cert trap for free-signing.** During M1, my keychain had an `Apple Development: ... (34SJ7XNNQJ)` cert from a previously-revoked Personal Team. The current Personal Team Xcode actually had account-level access to was `D97QT44UZB`, evidenced by the auto-created provisioning profile in `~/Library/Developer/Xcode/UserData/Provisioning Profiles/*.mobileprovision`. Reading the Team ID off the keychain cert (`security find-identity`) was misleading; the **provisioning profile's `TeamIdentifier`** is the authoritative source. The `docs/ios-developer-setup.md` instructions should reflect this (and do, after the M1 fix). Worth a project-wide note that any future iOS-signing debugging starts with `security cms -D -i <profile>.mobileprovision | grep -A1 TeamIdentifier`, not with the keychain.
+- **iOS dev-mode LAN permission is a UX gotcha (M3 polish).** First-launch of a dev build hits `http://<mac-LAN-IP>:1420/` for the React bundle and triggers iOS's Local Network permission alert. If the user dismisses it accidentally, the app appears broken with a wall-of-text error rather than a recoverable UI. Production builds don't have this (bundle is embedded), but M3 should ensure the dev-mode error screen is friendlier and gives a "open Settings" deep link.
+- **`tauri ios dev` tears down Vite on launch failure.** If the install/launch step fails (e.g. Developer Mode off, Untrusted Developer), the Vite dev server is killed too. The app on the device is then stranded — you can launch it from the home screen but it can't fetch the bundle. Workaround: re-run `npm run ios:dev` to bring everything back up together. Not a blocker but worth documenting in `docs/ios-developer-setup.md` as a troubleshooting note.

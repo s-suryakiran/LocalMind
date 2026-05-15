@@ -21,7 +21,7 @@ A "Personal Team" row appears under your Apple ID once you sign in.
 
 ## 3. Get your Team ID
 
-The free Personal Team's 10-character Team ID isn't shown directly in the Accounts pane until Xcode has provisioned a signing certificate. Easiest way to surface it:
+The free Personal Team's 10-character Team ID isn't shown directly in the Accounts pane until Xcode has provisioned a signing certificate. Surface it by letting Xcode generate the provisioning profile:
 
 ```bash
 open src-tauri/gen/apple/localmind.xcodeproj
@@ -33,15 +33,18 @@ In Xcode:
 3. **Signing & Capabilities** tab.
 4. **Team** dropdown → pick "Your Name (Personal Team)".
 
-Xcode auto-provisions a cert. The 10-character Team ID then shows in the **Signing Certificate** row (e.g. `Apple Development: yourname@example.com (ABCD1234EF)`).
-
-Alternatively, after Xcode has provisioned the cert:
+Xcode then writes a `.mobileprovision` file to `~/Library/Developer/Xcode/UserData/Provisioning Profiles/` containing the authoritative Team ID for the team Xcode has account-level access to. Read it out:
 
 ```bash
-security find-identity -v -p codesigning | grep -i "apple development"
+ls ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/
+# pick the most-recent .mobileprovision (or the one named after com.localmind.app)
+security cms -D -i ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/<UUID>.mobileprovision \
+  | grep -A1 TeamIdentifier
 ```
 
-The 10 characters in parentheses are your Team ID.
+Look for `<key>TeamIdentifier</key>` → the first `<string>` after it is your 10-character Team ID. Also useful nearby: `TeamName` (your real name).
+
+> ⚠️ **Don't read the Team ID from `security find-identity`.** Keychain certs can be stale (left over from a previously-revoked Personal Team), and the cert's "Apple Development: ... (XXXXXXXXXX)" common name may show a Team ID that Xcode no longer has account-level access to. This was a real M1 debugging trap — see the M1 plan's "Discovered during M1" notes. The provisioning profile is the source of truth because Xcode regenerates it from the live Apple ID, not from cached keychain state.
 
 ## 4. Create your local Tauri config override
 
